@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>GCP monitoring report</title></head>
+<body style="font-family:Arial,sans-serif;color:#172b4d;margin:24px">
+  <h1>GCP monitoring report</h1>
+  <p>{{ generated_at | localtime }} · {{ results | length }} checks · {{ problems }} problems</p>
+  <table style="border-collapse:collapse;width:100%" border="1" cellpadding="9">
+    <thead><tr>
+      <th>Status</th><th>Project</th><th>Service</th><th>Resource</th><th>Check</th>
+      <th>Value</th><th>Alarm condition</th><th>Owner</th>
+    </tr></thead>
+    <tbody>{% for result in results %}<tr>
+      <td><strong>{{ result.status }}</strong><br>{{ result.severity }}</td>
+      <td>{{ result.project_id }}</td><td>{{ result.service_type }}</td>
+      <td>{% if result.resource_url %}<a href="{{ result.resource_url }}">{{ result.resource_name }}</a>
+        {% else %}{{ result.resource_name }}{% endif %}</td>
+      <td>{{ result.rule_name }}<br><small>{{ result.check_type }} · {{ result.rule_id }}</small></td>
+      <td>{{ result.value if result.value is not none else '—' }}</td>
+      <td>{{ result.comparison_operator }} {{ result.threshold_value }}
+        {% if result.threshold_upper is not none %} / {{ result.threshold_upper }}{% endif %}</td>
+      <td>{{ result.owner }}{% if result.runbook_url %}<br>
+        <a href="{{ result.runbook_url }}">Runbook</a>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table>
+  <h2>Check details</h2>
+  {% for result in results %}
+  <p><strong>{{ result.rule_name }}</strong>: {{ result.message }}<br>
+    Window: {{ result.window_start | localtime }} – {{ result.window_end | localtime }}<br>
+    Pipeline: {{ result.pipeline_id or 'Not assigned' }} · Version: {{ result.rule_version }}</p>
+  {% endfor %}
+  <p>ERROR means the check could not be evaluated. NO_DATA is distinct from a successful check.</p>
+</body></html>
