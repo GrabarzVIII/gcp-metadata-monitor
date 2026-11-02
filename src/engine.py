@@ -90,13 +90,15 @@ class Monitor:
             "notifications": [],
             "preview": preview,
         }
+        results: list[Result] = []
+        results_write_attempted = False
+        failure: Exception | None = None
         try:
             profiles = self._profiles()
             rows = self.store.read_active("monitoring_rules")
             ids = [row.get("rule_id") for row in rows]
             if len(ids) != len(set(ids)):
                 raise ValueError("Duplicate rule_id values in metadata")
-            results = []
             for raw in rows:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Run budget exceeded; split rules into smaller deployments")
@@ -110,48 +112,79 @@ class Monitor:
                     logger.error("invalid_rule rule_id=%s", rule_id)
                     continue
                 result = check_rule(rule, run_id, end, self.store, self.logs)
-                self.store.save_results([result])
                 results.append(result)
-            record["rule_count"] = len(results)
-            record["problem_count"] = sum(result.status != Status.OK for result in results)
+                record["rule_count"] += 1
+                record["problem_count"] += result.status != Status.OK
+            # One load job per run avoids per-table load quotas at higher rule counts.
+            results_write_attempted = True
+            self.store.save_results(results)
             for profile in profiles.values():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Run budget exceeded before report delivery")
                 html = render_report(profile, results, self.settings.report_timezone)
                 if html is None:
                     continue
-                self.state.save_report(run_id, profile.profile_id, html)
-                delivery = {"profile_id": profile.profile_id, "status": "PREVIEW"}
-                if not preview and self.settings.notifications_enabled:
-                    try:
+                delivery = {
+                    "profile_id": profile.profile_id,
+                    "status": "PREVIEW" if preview else "DISABLED",
+                }
+                try:
+                    self.state.save_report(run_id, profile.profile_id, html)
+                    if not preview and self.settings.notifications_enabled:
                         self.sender.send(profile, html, run_id)
                         delivery["status"] = "SENT"
-                    except Exception as exc:
-                        delivery["status"] = "FAILED"
-                        logger.error(
-                            "notification_failed profile_id=%s error_type=%s",
-                            profile.profile_id,
-                            type(exc).__name__,
-                        )
+                except Exception as exc:
+                    delivery["status"] = "FAILED"
+                    logger.error(
+                        "notification_failed profile_id=%s error_type=%s",
+                        profile.profile_id,
+                        type(exc).__name__,
+                    )
                 record["notifications"].append(delivery)
+                # Persist accepted deliveries before attempting the next profile.
+                self.state.checkpoint(run_id, record)
             record["status"] = "COMPLETED"
-            if record["configuration_errors"] or any(
-                item["status"] == "FAILED" for item in record["notifications"]
+            if (
+                not results
+                or record["configuration_errors"]
+                or any(result.status == Status.ERROR for result in results)
+                or any(item["status"] == "FAILED" for item in record["notifications"])
             ):
                 record["status"] = "NEEDS_ATTENTION"
-            return record
-        except Exception:
+        except Exception as exc:
+            failure = exc
             record["status"] = "FAILED"
-            raise
-        finally:
-            record["finished_at"] = datetime.now(UTC).isoformat()
-            # Keep the claim on failure. Blind retries could duplicate partially delivered emails.
+
+        # Preserve partial observations, but never retry an ambiguous BigQuery load here.
+        if results and not results_write_attempted:
+            try:
+                self.store.save_results(results)
+            except Exception as exc:
+                failure = failure or exc
+                record["status"] = "FAILED"
+        record["finished_at"] = datetime.now(UTC).isoformat()
+        try:
             self.store.save_run(
                 {
                     **record,
                     "notifications": json.dumps(record["notifications"]),
                 }
             )
+        except Exception as exc:
+            failure = failure or exc
+            record["status"] = "FAILED"
+            logger.error("run_history_failed run_id=%s error_type=%s", run_id, type(exc).__name__)
+        try:
+            # Save a terminal state even when BigQuery history is unavailable.
             self.state.finish(run_id, record)
-            logger.info("monitor_run_finished run_id=%s status=%s", run_id, record["status"])
+        except Exception as exc:
+            failure = failure or exc
+            record["status"] = "FAILED"
+            logger.error("run_state_failed run_id=%s error_type=%s", run_id, type(exc).__name__)
+        logger.info("monitor_run_finished run_id=%s status=%s", run_id, record["status"])
+        if failure is not None:
+            raise failure
+        return record
 
     def _profiles(self) -> dict[str, Profile]:
         profiles = [

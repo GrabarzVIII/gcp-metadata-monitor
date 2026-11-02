@@ -1,13 +1,8 @@
-.gcloudignore
-.git
-.gitignore
-.venv
-.env
-.env.*
-terraform
-tests
-reports
-__pycache__
-.pytest_cache
-.ruff_cache
-*.egg-info
+# Only runtime source and dependencies are uploaded by gcloud.
+*
+!main.py
+!requirements.txt
+!src/
+!src/**
+**/__pycache__/**
+**/*.pyc

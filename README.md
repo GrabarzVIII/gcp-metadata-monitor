@@ -2,44 +2,40 @@
 
 [![CI](https://github.com/GrabarzVIII/gcp-metadata-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/GrabarzVIII/gcp-metadata-monitor/actions/workflows/ci.yml)
 
-Monitor Google Cloud logs and BigQuery data quality across projects using rules stored in BigQuery. Each rule identifies the project, service, resource, console link, check type, and alarm condition. Reports are routed to configured email profiles.
+A Python **Cloud Run function** that reads monitoring rules from BigQuery, checks logs and data quality across GCP projects, and produces HTML reports for configured recipient profiles. Deploy directly from source with `gcloud run deploy --source . --function run_monitoring`.
 
-**Status: deployable MVP.** Tests cover the engine and mocked cloud boundaries. Terraform configuration is validated. Live cloud integration and SMTP delivery must be verified in your own environment. No resources are deployed automatically by this repository's CI.
+The repository contains the function, SQL scripts, tests, and this deployment manual. Google builds the runtime using managed buildpacks; you do not maintain a Dockerfile, build pipeline, or Terraform stack.
 
-## Features
+## Supported checks
 
-- Resource-scoped log counts for Cloud Run, Scheduler, Workflows, Dataform, or other matching logs.
-- Scalar SQL KPIs and templates for freshness, row counts, null rates, and duplicate counts.
-- Explicit `OK`, `ALERT`, `ERROR`, and `NO_DATA` outcomes.
-- Per-profile HTML reports with resource links, observations, thresholds, and owners.
-- Rule snapshots and execution history in BigQuery; private reports in Cloud Storage.
-- BigQuery dry runs, SELECT-only validation, query deadlines, and scan limits.
-- Atomic scheduled-run claims to prevent duplicate concurrent processing.
-- Cloud Run, Scheduler OIDC authentication, dataset-scoped IAM, and Secret Manager.
-- Offline demo, tests, Docker image, Terraform, and GitHub Actions CI.
+| Check | Observation |
+|---|---|
+| LOG | Number of entries matching a resource-scoped Cloud Logging filter |
+| SQL_KPI | A numeric scalar returned by your SELECT query |
+| FRESHNESS | Minutes since the latest data timestamp |
+| ROW_COUNT | Number of records in the observation window |
+| NULL_RATE | Fraction of records missing a specified value |
+| DUPLICATES | Number of excess rows for a configured key |
 
-Direct Cloud Monitoring metrics, native execution-status APIs, incident lifecycles, business calendars, and per-rule schedules are **not implemented in this MVP**. See [the roadmap](docs/ROADMAP.md). `service_type` describes the resource; it does not automatically select an API adapter.
+A rule identifies the project, service type, resource name/link, check type, alarm comparison, threshold, and recipient profiles. Results distinguish **OK, ALERT, ERROR, and NO_DATA**. See [the rule reference](docs/RULES.md).
 
-## Architecture
+Service labels such as DATAFORM or WORKFLOWS do not imply native execution-status APIs. Use resource-scoped logs or SQL checks in this version. Metric adapters, business calendars, incident lifecycles, and per-rule schedules remain future work.
 
 ```mermaid
 flowchart LR
-    Scheduler[Cloud Scheduler] -->|OIDC POST| Engine[Private Cloud Run service]
-    Rules[(BigQuery rules and profiles)] --> Engine
-    Engine --> Logging[Cloud Logging in source projects]
-    Engine --> Queries[BigQuery SELECT queries]
-    Engine --> History[(BigQuery results and runs)]
-    Engine --> State[(Cloud Storage claims and reports)]
-    Secret[Secret Manager SMTP password] --> Engine
-    Engine --> SMTP[SMTP over TLS]
-    SMTP --> Recipients[Configured recipients]
+    Scheduler[Cloud Scheduler] -->|OIDC POST| Function[Cloud Run function]
+    Config[(BigQuery rules and profiles)] --> Function
+    Function --> Logs[Cloud Logging]
+    Function --> SQL[BigQuery SELECT queries]
+    Function --> Results[(BigQuery results and run history)]
+    Function --> State[(Private Storage claims and reports)]
+    Secrets[Secret Manager] --> Function
+    Function --> SMTP[SMTP over TLS]
 ```
 
-One `monitoring_rules` row represents one check. Several rows may monitor the same resource. Query billing belongs to the hosting project; source datasets remain in their original projects. A rule's `location` must match the queried BigQuery data. Metadata can use a separate location.
+## Local setup
 
-## Try locally without GCP
-
-Requires Python 3.11 or 3.12 and Git. Tested dependencies are recorded in `constraints.txt`.
+Use Python 3.11 or 3.12. Cloud deployment below uses Python 3.12.
 
 ```bash
 git clone https://github.com/GrabarzVIII/gcp-metadata-monitor.git
@@ -47,107 +43,115 @@ cd gcp-metadata-monitor
 python -m venv .venv
 ```
 
-Activate in Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Activate in Linux/macOS:
+Activate with `.venv/Scripts/Activate.ps1` in PowerShell or `source .venv/bin/activate` on Linux/macOS. If PowerShell blocks activation, call `.\.venv\Scripts\python.exe` directly instead of changing the machine's execution policy.
 
 ```bash
-source .venv/bin/activate
-```
-
-Then:
-
-```bash
-python -m pip install -c constraints.txt -e ".[dev]"
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
 python -m src.cli demo
 ```
 
-Open `reports/demo/daily_report.html`. Synthetic results include a success, an alarm, missing data, and an intentional query failure. The demo does not contact GCP or send email. `results.json` contains the observations. The intentional failure also produces an error log line.
+Open `reports/demo/daily_report.html`. This synthetic demo needs no cloud credentials and sends no email. The intentional failed check is included to demonstrate ERROR handling.
 
-## Deploy to your GCP environment
-
-The following commands use Bash and work in Google Cloud Shell. Terraform commands also work in PowerShell with the corresponding variable syntax. Install Google Cloud CLI and Terraform >= 1.6, < 2.0. Docker is optional when using Cloud Build.
-
-### 1. Prerequisites and access
-
-Choose an existing hosting project with billing enabled and existing source projects/datasets. The deployer needs permission to enable APIs, create the resources declared by Terraform, and update IAM in the hosting project and on selected source projects/datasets. Have your administrator grant appropriate scoped administrative roles for your organization. Acting as the runtime, Scheduler, and builder accounts requires `iam.serviceAccounts.actAs`. Submitting builds requires Cloud Build permissions and write access to the build-source bucket.
-
-Runtime access is deliberately narrower:
-
-| Identity | Access |
-|---|---|
-| Runtime | BigQuery jobs in hosting project; metadata read; history-table write; selected source-dataset read; selected project logs read; state objects; one SMTP secret |
-| Scheduler | Invoke this Cloud Run service |
-| Builder | Read build-source bucket, write image repository, write build logs |
-
-Do not grant `allUsers` the Cloud Run invoker role. The app relies on Cloud Run IAM and must not be exposed directly on an unauthenticated public server. Enable the Logging API in source projects when needed. Private audit logs or custom log views may need additional scoped permissions. Organization policies and VPC Service Controls must permit cross-project access.
+Run the real function locally:
 
 ```bash
-gcloud auth login
-gcloud auth application-default login
+functions-framework --target=run_monitoring --source=main.py --port=8080
+```
+
+`GET /healthz` does not initialize cloud clients. A POST to `/` with `{"preview":true}` evaluates live rules and therefore requires ADC and deployment settings. Copy `.env.example` to `.env` for local live testing. The local development server has no IAM authentication; keep it on a trusted machine.
+
+## Deployment manual
+
+The commands below are for **Bash / Google Cloud Shell**, from the repository root. Install a current Google Cloud CLI with Cloud Run function support. Use an existing project with billing enabled; replace every sample value with your own.
+
+### 1. Choose configuration and enable APIs
+
+```bash
 export PROJECT_ID="your-monitoring-project"
 export REGION="europe-west1"
+export BQ_LOCATION="EU"
+export DATASET_ID="monitoring"
+export FUNCTION_NAME="gcp-metadata-monitor"
+export STATE_BUCKET="$PROJECT_ID-monitor-state"
+export RUNTIME_SA="gcp-monitor-runtime@$PROJECT_ID.iam.gserviceaccount.com"
+export BUILDER_SA="gcp-monitor-builder@$PROJECT_ID.iam.gserviceaccount.com"
+export SCHEDULER_SA="gcp-monitor-scheduler@$PROJECT_ID.iam.gserviceaccount.com"
+
+gcloud auth login
 gcloud config set project "$PROJECT_ID"
-gcloud auth application-default set-quota-project "$PROJECT_ID"
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com bigquery.googleapis.com logging.googleapis.com \
+  storage.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com \
+  iam.googleapis.com
 ```
 
-Cloud Shell's existing authentication may be sufficient. Do not download service-account keys for Cloud Run.
+Cloud Shell may already be authenticated. Local previews use `gcloud auth application-default login`. No service-account key files are needed.
 
-### 2. Bootstrap the image repository
+An administrator must authorize initial setup: service-account creation, API enablement, resource creation, and IAM changes. Source deployment requires Cloud Run Source Developer, Service Usage Consumer, and permission to act as the runtime/build accounts. The operator creating Scheduler needs permission to act as its invoker account. See [Google's source deployment requirements](https://docs.cloud.google.com/run/docs/deploy-functions).
+
+### 2. Create service accounts and a private state bucket
+
+For a new installation:
 
 ```bash
-terraform -chdir=terraform/bootstrap init
-terraform -chdir=terraform/bootstrap plan \
-  -var="project_id=$PROJECT_ID" -var="region=$REGION" -out=bootstrap.tfplan
-terraform -chdir=terraform/bootstrap apply bootstrap.tfplan
+gcloud iam service-accounts create gcp-monitor-runtime --display-name="Monitoring runtime"
+gcloud iam service-accounts create gcp-monitor-builder --display-name="Function source builder"
+gcloud iam service-accounts create gcp-monitor-scheduler --display-name="Scheduler invoker"
 
-export IMAGE="$(terraform -chdir=terraform/bootstrap output -raw image_repository)/engine:v0.1.0"
-export BUILD_SA="$(terraform -chdir=terraform/bootstrap output -raw build_service_account)"
-export BUILD_BUCKET="$(terraform -chdir=terraform/bootstrap output -raw build_source_bucket)"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$BUILDER_SA" --role=roles/run.builder
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/bigquery.jobUser
+
+gcloud storage buckets create "gs://$STATE_BUCKET" --project="$PROJECT_ID" \
+  --location="$REGION" --uniform-bucket-level-access --public-access-prevention
+gcloud storage buckets add-iam-policy-binding "gs://$STATE_BUCKET" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectUser
 ```
 
-Bootstrap and application have separate Terraform states. Keep both private and backed up. For teams, configure a remote backend with locking before collaborating. Local state/plans are ignored by Git.
+If resources already exist, inspect and reuse them rather than recreating them. Grant the deployer `roles/iam.serviceAccountUser` on the runtime/build accounts and the Scheduler operator that role on the Scheduler account when needed. Builder, runtime, and invoker identities have different duties.
 
-### 3. Build the image
+### 3. Create tables with SQL
 
-From the repository root:
+Edit the declarations at the top of [sql/01_tables.sql](sql/01_tables.sql), then run the full script in the BigQuery editor, selecting the matching query location. Alternatively, after editing:
 
 ```bash
-gcloud builds submit . --project="$PROJECT_ID" --region="$REGION" \
-  --config=cloudbuild.yaml --substitutions="_IMAGE=$IMAGE" \
-  --service-account="$BUILD_SA" \
-  --gcs-source-staging-dir="gs://$BUILD_BUCKET/source"
+bq query --project_id="$PROJECT_ID" --location="$BQ_LOCATION" \
+  --use_legacy_sql=false < sql/01_tables.sql
 ```
 
-Use a new image tag for each release and preferably set Terraform's `image` to its immutable digest. Build ignore files exclude environments, Terraform state, and `.env` files.
+The script creates the dataset and these tables:
 
-### 4. Deploy infrastructure
+| Table | Purpose |
+|---|---|
+| notification_profiles | Recipient addresses and report filtering |
+| monitoring_rules | Resource identity, check configuration, thresholds, routing |
+| monitoring_results | Observations and evaluated rule snapshots |
+| monitoring_runs | Run status, counts, and delivery outcomes |
+
+The two history tables are partitioned and default to 90-day retention. The script is safe to rerun: existing tables are preserved. It does not migrate their schema or change existing partition retention. SQL is the schema source of truth; generated JSON schemas and stored procedures are not required. The function executes SELECT queries directly.
+
+### 4. Grant runtime access to data and logs
+
+Adapt [sql/04_permissions.sql](sql/04_permissions.sql). Run the metadata grants in the metadata location; run each source-dataset grant separately in that dataset's location. The runtime can read metadata/source data and write only the two history tables. Do not give it write access to source datasets.
+
+For each project whose logs will be checked:
 
 ```bash
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+export SOURCE_PROJECT="your-source-project"
+gcloud services enable logging.googleapis.com --project="$SOURCE_PROJECT"
+gcloud projects add-iam-policy-binding "$SOURCE_PROJECT" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/logging.viewer
 ```
 
-Edit the copy: set project, region, built image URI, source projects/datasets, and schedule/timezone. Keep `scheduler_paused = true` and `notifications_enabled = false` initially. Sample identifiers must be replaced.
+Private audit logs and restricted log views may need additional scoped grants. Organization policies and VPC Service Controls must allow the intended cross-project reads. BigQuery queries are billed to the hosting project; each rule's location must match its source data.
 
-```bash
-terraform -chdir=terraform init
-terraform -chdir=terraform plan -out=deployment.tfplan
-terraform -chdir=terraform apply deployment.tfplan
-terraform -chdir=terraform output
-```
+### 5. Add rules and recipient profiles
 
-Terraform creates all four BigQuery tables from `sql/schemas/*.json`. Do not run the DDL separately. `sql/01_tables.sql` is an alternative for externally managed BigQuery; import existing tables before managing them with Terraform.
+Edit the declarations in [sql/02_sample_data.sql](sql/02_sample_data.sql), then run it in the metadata location. It inserts example checks for volume, freshness, a SQL KPI, and service errors. Re-running it preserves existing records and does not create duplicates.
 
-The default schedule is 08:00 `Europe/Warsaw`. Rules use rolling windows ending at the scheduled timestamp, excluding that endpoint. A 1,440-minute window is **not** the previous local calendar day. DST transitions can cause overlap or gaps between daily windows; use UTC scheduling for uniform windows or explicit calendar SQL.
-
-### 5. Add profiles and rules
-
-Adapt `sql/02_sample_data.sql` in the BigQuery editor, replacing all identifiers and recipient addresses. Samples are disabled by default. Enable a reviewed profile and rule:
+Examples are disabled. Review the filters, source column types, recipient address, and thresholds before activation:
 
 ```sql
 UPDATE `your-monitoring-project.monitoring.notification_profiles`
@@ -156,92 +160,114 @@ UPDATE `your-monitoring-project.monitoring.monitoring_rules`
 SET is_active = TRUE WHERE rule_id = 'orders-count';
 ```
 
-IDs must be unique; the engine checks this because BigQuery does not enforce it here. Nullable omitted fields use application defaults. Only rows with explicit `is_active = TRUE` are loaded. Referenced profiles must be active. Restrict metadata editing to trusted operators: SQL executes with the runtime's data access and profiles determine recipients.
+Only explicit TRUE values activate records. IDs must be unique and referenced profiles active. Configuration editors are trusted operators: their queries run with the runtime identity and their profiles control recipients. Validate exported rule JSON with `python -m src.cli validate examples/rules.json`; SQL syntax and permissions are checked during live preview.
 
-See [the rule guide](docs/RULES.md) for templates, comparisons, and SQL examples.
-
-### 6. Preview
-
-An administrator can grant your testing identity permission to invoke the service:
+### 6. Deploy the function from source
 
 ```bash
-gcloud run services add-iam-policy-binding gcp-metadata-monitor \
-  --project="$PROJECT_ID" --region="$REGION" \
-  --member="user:YOUR_EMAIL" --role=roles/run.invoker
+cp deploy.env.yaml.example deploy.env.yaml
 ```
 
-Then:
+Edit `deploy.env.yaml` to match your settings. Keep `NOTIFICATIONS_ENABLED: "false"`. Values must be strings; do not add the SMTP password. This file is ignored by Git and excluded from source uploads.
 
 ```bash
-export SERVICE_URL="$(terraform -chdir=terraform output -raw service_url)"
-curl --fail-with-body -X POST "$SERVICE_URL/run-monitoring" \
+gcloud run deploy "$FUNCTION_NAME" --project="$PROJECT_ID" --region="$REGION" \
+  --source=. --function=run_monitoring --base-image=python312 \
+  --build-service-account="projects/$PROJECT_ID/serviceAccounts/$BUILDER_SA" \
+  --service-account="$RUNTIME_SA" --env-vars-file=deploy.env.yaml \
+  --no-allow-unauthenticated --timeout=1800 --memory=512Mi \
+  --concurrency=1 --max-instances=1
+
+export FUNCTION_URL="$(gcloud run services describe "$FUNCTION_NAME" \
+  --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+```
+
+Google manages source building and runtime artifacts. You do not run `docker build` or create an image URI. `.gcloudignore` uploads only `main.py`, `requirements.txt`, and `src/`. IAM authentication must remain enabled; do not grant `allUsers` or `allAuthenticatedUsers` access. When updating an existing service, inspect its IAM policy because existing public grants may need explicit removal.
+
+### 7. Preview before sending email
+
+An administrator can grant your testing identity `roles/run.invoker` on this function:
+
+```bash
+gcloud run services add-iam-policy-binding "$FUNCTION_NAME" --region="$REGION" \
+  --member="user:YOUR_EMAIL" --role=roles/run.invoker
+
+curl --fail-with-body -X POST "$FUNCTION_URL" \
   -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
   -H "Content-Type: application/json" -d '{"preview":true}'
 ```
 
-Inspect the returned `run_id` in `monitoring_results` and `monitoring_runs`. Download its private report:
+Preview reads live data and writes results/artifacts but sends no email. Inspect the returned `run_id`, the BigQuery history tables, and the private report:
 
 ```bash
-export STATE_BUCKET="$(terraform -chdir=terraform output -raw state_bucket)"
 gcloud storage cp "gs://$STATE_BUCKET/reports/RUN_ID/data-team.html" ./preview.html
 ```
 
-Preview executes queries, incurs normal costs, and writes history/reports, but sends no email. Manual requests get new run IDs. Add `"window_end":"2026-01-02T08:00:00Z"` to inspect a fixed historical window.
+Manual requests may specify `"window_end":"2026-01-02T08:00:00Z"`. Scheduled calls use their scheduled timestamp and cannot override it. Missing rules or invalid configuration return a visible error rather than a misleading successful empty run.
 
-For a local live preview, copy `.env.example` to `.env`, set deployment values, authenticate through ADC, and run `python -m src.cli preview`. Your local identity needs the appropriate permissions. Do not commit `.env`.
+### 8. Configure SMTP and test delivery
 
-### 7. Configure SMTP
-
-Terraform initially creates an empty secret. Add a password outside Terraform so it does not enter state or shell history:
+Create the secret once, then add password versions outside source control:
 
 ```bash
+gcloud secrets create gcp-monitor-smtp-password --replication-policy=automatic
 read -r -s -p "SMTP password: " SMTP_PASSWORD
 printf '\n'
-printf '%s' "$SMTP_PASSWORD" | gcloud secrets versions add gcp-monitor-smtp-password \
-  --project="$PROJECT_ID" --data-file=-
+printf '%s' "$SMTP_PASSWORD" | gcloud secrets versions add gcp-monitor-smtp-password --data-file=-
 unset SMTP_PASSWORD
+
+gcloud secrets add-iam-policy-binding gcp-monitor-smtp-password \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor
 ```
 
-Set `smtp_host`, `smtp_port`, `smtp_user`, `smtp_from`, and `smtp_security` in your private `.tfvars`. Use STARTTLS/587 or SSL/465 according to your provider. Pin `smtp_secret_version` to the uploaded version for controlled rollout. Set `notifications_enabled = true`, keep Scheduler paused, then review and apply Terraform again.
-
-Make one deliberate delivery test using `{"preview":false}`. Verify recipients and sender/domain verification with your SMTP provider. Sending requires both `preview:false` and `NOTIFICATIONS_ENABLED=true`.
-
-### 8. Enable scheduling
-
-Set `scheduler_paused = false`, review the plan, and apply. Verify the first scheduled execution. Configure independent alerts for failed Scheduler requests and missing daily successful runs. The service logs `monitor_run_finished run_id=... status=COMPLETED` after history persistence. `/healthz` only checks process liveness.
-
-Read [the operations guide](docs/OPERATIONS.md): interrupted runs are not automatically replayed because SMTP delivery and state persistence cannot form an exactly-once transaction.
-
-## Development
+Set SMTP host, port, user, sender, and TLS mode in `deploy.env.yaml`; set `NOTIFICATIONS_ENABLED: "true"`. Use STARTTLS/587 or SSL/465 as required by the provider. Verify sender/domain authorization with your provider.
 
 ```bash
-ruff check src tests scripts
-ruff format --check src tests scripts
-python -m pytest -q
-python scripts/generate_schemas.py
-terraform fmt -check -recursive terraform
-terraform -chdir=terraform init -backend=false
-terraform -chdir=terraform validate
-terraform -chdir=terraform/bootstrap init -backend=false
-terraform -chdir=terraform/bootstrap validate
+# Replace 1 with the actual uploaded version.
+gcloud run services update "$FUNCTION_NAME" --region="$REGION" \
+  --env-vars-file=deploy.env.yaml --update-secrets=SMTP_PASS=gcp-monitor-smtp-password:1
 ```
 
-CI checks Python on Linux/Windows, validates both Terraform roots, builds the container, and executes its offline demo. No cloud credentials are needed. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch workflow.
+Repeat the authenticated POST with `{"preview":false}` and confirm delivery. Both this flag and the environment setting must allow email. Do not blindly repeat a timed-out delivery request; inspect run state and the SMTP provider first.
 
-## Limits and costs
+### 9. Schedule the function
 
-- Designed for modest scheduled rule sets. Execution is sequential with a 25-minute orchestration budget and 30-minute Cloud Run/Scheduler deadline. An individual API call can outlive the orchestration budget; size deployments conservatively.
-- Log checks read matching entries with a default 10,000-entry cap. Exceeding it is an ERROR, not an approximate count. Use metrics or aggregate tables at higher volume.
-- SQL defaults: 1 GiB scan cap per query and 60-second result wait. Cancellation is best-effort and may still incur costs. Freshness checks can scan history; use a compact ingestion-audit table for large sources.
-- BigQuery, Cloud Run, builds, Storage, Secret Manager, and SMTP can incur costs. A query scan cap is not a project budget.
-- History partitions expire after 90 days by default. Claims/reports expire after 90 days, limiting the deduplication horizon.
-- This is scheduled operational/data-quality reporting; immediate infrastructure alerting remains a separate responsibility.
+Create the schedule after validating the function and report recipients:
 
-## References and license
+```bash
+gcloud run services add-iam-policy-binding "$FUNCTION_NAME" --region="$REGION" \
+  --member="serviceAccount:$SCHEDULER_SA" --role=roles/run.invoker
 
-- [BigQuery cost controls](https://docs.cloud.google.com/bigquery/docs/best-practices-costs)
-- [Scheduler delivery semantics](https://docs.cloud.google.com/scheduler/docs/overview)
-- [Cloud Run scheduling](https://docs.cloud.google.com/run/docs/triggering/using-scheduler)
-- [Terraform Google provider](https://registry.terraform.io/providers/hashicorp/google/latest/docs)
+gcloud scheduler jobs create http gcp-monitor-daily --location="$REGION" \
+  --schedule='0 8 * * *' --time-zone='Europe/Warsaw' \
+  --uri="$FUNCTION_URL" --http-method=POST \
+  --oidc-service-account-email="$SCHEDULER_SA" --oidc-token-audience="$FUNCTION_URL" \
+  --headers='Content-Type=application/json' --message-body='{"preview":false}' \
+  --attempt-deadline=1800s --max-retry-attempts=0 --max-retry-duration=0s
+```
+
+For an initial scheduled preview, use `{"preview":true}` instead. Creation activates the schedule; use `gcloud scheduler jobs pause gcp-monitor-daily --location="$REGION"` when needed. Keep the audience equal to the base function URL. Preserve the Google-managed Scheduler service agent role.
+
+Each rule uses a rolling window. A 1,440-minute window is not the previous local calendar day; DST changes can cause daily overlap/gaps. Use UTC scheduling for fixed daily windows or explicit calendar SQL.
+
+## Operations, limits, and validation
+
+- SQL limits default to 1 GiB scanned per query and a 60-second result wait. Cancellation is best effort and queries can incur charges. Only one scalar SELECT is accepted.
+- Log reads use one deadline across pages and a 10,000-entry limit; truncation is an ERROR, never a fabricated exact count.
+- Evaluations are sequential with a 25-minute orchestration budget, leaving time for persistence inside the 30-minute HTTP deadline. Use modest rule sets. Individual API operations and retries can extend beyond the orchestration budget.
+- Results use one BigQuery load job per run. The function retains partial observations on graceful failure, checkpoints delivery progress, and attempts a terminal Storage state even when BigQuery history is unavailable.
+- Duplicate scheduled runs are claimed atomically. SMTP and state writes are not a transaction: exactly-once email is not guaranteed. Failed/interrupted claims need operator inspection.
+- Configure independent alerts for failed Scheduler requests and missing completion logs. GET /healthz checks process liveness only.
+- Storage objects have no automatic expiry in this manual. Configure report retention separately from claims; deleting claims shortens the deduplication horizon.
+
+See [operations and recovery](docs/OPERATIONS.md) and [operational SQL](sql/03_operational_queries.sql). Source builds, runtime requests, BigQuery, Storage, Secret Manager, and SMTP can incur charges. Existing Terraform-managed installations require an explicit ownership/migration decision before using manual gcloud updates; removing repository files does not destroy their infrastructure.
+
+```bash
+ruff check main.py src tests
+ruff format --check main.py src tests
+python -m pytest -q
+```
+
+CI tests Python 3.11/3.12 on Windows/Linux and loads the function using only production requirements. It does not deploy cloud resources or send email. Local tests mock cloud APIs; live SQL execution, GCP IAM, source builds, and SMTP delivery must be verified in your own project.
 
 MIT license; see [LICENSE](LICENSE).
