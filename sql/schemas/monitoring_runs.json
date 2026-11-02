@@ -1,0 +1,52 @@
+[
+  {
+    "name": "run_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "started_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "window_end",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "finished_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "rule_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "problem_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "configuration_errors",
+    "type": "STRING",
+    "mode": "REPEATED"
+  },
+  {
+    "name": "notifications",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "preview",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  }
+]
