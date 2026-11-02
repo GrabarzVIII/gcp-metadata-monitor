@@ -1,0 +1,13 @@
+.gcloudignore
+.git
+.gitignore
+.venv
+.env
+.env.*
+terraform
+tests
+reports
+__pycache__
+.pytest_cache
+.ruff_cache
+*.egg-info

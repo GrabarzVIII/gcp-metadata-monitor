@@ -1,0 +1,21 @@
+project_id = "your-monitoring-project"
+region     = "europe-west1"
+image      = "europe-west1-docker.pkg.dev/your-monitoring-project/gcp-monitor/engine:v0.1.0"
+
+dataset_id = "monitoring"
+bq_location = "EU"
+monitored_projects = ["your-source-project"]
+source_datasets = [
+  { project_id = "your-source-project", dataset_id = "warehouse" }
+]
+
+schedule              = "0 8 * * *"
+timezone              = "Europe/Warsaw"
+scheduler_paused      = true
+notifications_enabled = false
+smtp_host             = "smtp.example.com"
+smtp_port             = 587
+smtp_user             = ""
+smtp_from             = "monitor@example.com"
+smtp_security         = "starttls"
+# Upload the SMTP password with gcloud; never put it in this file or Terraform state.

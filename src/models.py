@@ -64,7 +64,7 @@ class Rule(BaseModel):
 
 
 class Profile(BaseModel):
-    profile_id: str
+    profile_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
     email_addresses: list[str] = Field(min_length=1)
     only_problems: bool = False
     is_active: bool = True

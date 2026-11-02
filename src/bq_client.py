@@ -33,7 +33,8 @@ class BigQueryStore:
         for row in rows:
             if isinstance(row.get("check_config"), str):
                 row["check_config"] = json.loads(row["check_config"])
-        return rows
+        # Nullable metadata columns use model defaults when omitted by an INSERT.
+        return [{key: value for key, value in row.items() if value is not None} for row in rows]
 
     def execute_kpi(self, rule: Rule, start: datetime, end: datetime) -> float | None:
         sql = build_query(rule)

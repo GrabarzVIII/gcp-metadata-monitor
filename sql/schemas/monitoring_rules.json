@@ -1,0 +1,122 @@
+[
+  {
+    "name": "rule_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "rule_name",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "rule_version",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "project_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "service_type",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "resource_name",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "resource_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "resource_url",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "location",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "check_type",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "log_filter",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "kpi_query",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "check_config",
+    "type": "JSON",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "comparison_operator",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "threshold_value",
+    "type": "FLOAT",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "threshold_upper",
+    "type": "FLOAT",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "window_minutes",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "severity",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "no_data_policy",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "target_profiles",
+    "type": "STRING",
+    "mode": "REPEATED"
+  },
+  {
+    "name": "pipeline_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "owner",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "runbook_url",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "is_active",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  }
+]

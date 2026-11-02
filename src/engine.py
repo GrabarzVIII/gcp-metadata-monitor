@@ -151,6 +151,7 @@ class Monitor:
                 }
             )
             self.state.finish(run_id, record)
+            logger.info("monitor_run_finished run_id=%s status=%s", run_id, record["status"])
 
     def _profiles(self) -> dict[str, Profile]:
         profiles = [
