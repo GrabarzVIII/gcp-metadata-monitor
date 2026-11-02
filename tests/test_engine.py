@@ -2,11 +2,9 @@ from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import pytest
-from fastapi.testclient import TestClient
 from google.api_core.exceptions import PreconditionFailed
 
 from src.engine import Monitor, check_rule
-from src.main import app
 from src.models import Profile
 from src.report_generator import render_report
 from src.state import RunAlreadyClaimed, RunState
@@ -92,5 +90,88 @@ def test_incomplete_claim_blocks_blind_retry():
         RunState("state-bucket", client).claim("test")
 
 
-def test_health_requires_no_cloud_credentials():
-    assert TestClient(app).get("/healthz").json() == {"status": "ok"}
+def test_history_failure_still_persists_failed_state(settings, rule):
+    monitor = make_monitor(settings, rule)
+    monitor.store.save_run.side_effect = RuntimeError("BigQuery unavailable")
+    with pytest.raises(RuntimeError, match="BigQuery unavailable"):
+        monitor.run("history-failure", datetime.now(UTC))
+    saved = monitor.state.finish.call_args.args[1]
+    assert saved["status"] == "FAILED"
+    assert saved["rule_count"] == 1
+    assert saved["finished_at"] is not None
+
+
+def test_original_failure_survives_secondary_persistence_failure(settings, rule):
+    monitor = make_monitor(settings, rule)
+    monitor.store.read_active.side_effect = ValueError("Invalid metadata")
+    monitor.store.save_run.side_effect = RuntimeError("BigQuery unavailable")
+    with pytest.raises(ValueError, match="Invalid metadata"):
+        monitor.run("original-failure", datetime.now(UTC))
+    assert monitor.state.finish.call_args.args[1]["status"] == "FAILED"
+
+
+def test_results_are_written_in_one_batch(settings, rule):
+    monitor = make_monitor(settings, rule)
+    second = rule.model_copy(update={"rule_id": "orders-two"})
+    monitor.store.read_active.side_effect = [
+        [{"profile_id": "ops", "email_addresses": ["ops@example.com"]}],
+        [rule.model_dump(), second.model_dump()],
+    ]
+    record = monitor.run("batch", datetime.now(UTC))
+    monitor.store.save_results.assert_called_once()
+    assert len(monitor.store.save_results.call_args.args[0]) == 2
+    assert record["rule_count"] == 2
+
+
+def test_empty_configuration_is_not_reported_as_healthy(settings, rule):
+    monitor = make_monitor(settings, rule)
+    monitor.store.read_active.side_effect = [[], []]
+    assert monitor.run("empty", datetime.now(UTC))["status"] == "NEEDS_ATTENTION"
+
+
+def test_query_errors_make_run_need_attention(settings, rule):
+    monitor = make_monitor(settings, rule)
+    monitor.store.execute_kpi.side_effect = RuntimeError()
+    result = monitor.run("query-error", datetime.now(UTC))
+    assert result["status"] == "NEEDS_ATTENTION"
+    assert result["problem_count"] == 1
+
+
+def test_disabled_email_is_distinct_from_preview(settings, rule):
+    monitor = make_monitor(settings, rule)
+    result = monitor.run("disabled", datetime.now(UTC), preview=False)
+    assert result["notifications"][0]["status"] == "DISABLED"
+    monitor.sender.send.assert_not_called()
+
+
+def test_failed_artifact_does_not_skip_next_profile(settings, rule):
+    settings.notifications_enabled = True
+    rule.target_profiles = ["ops", "data"]
+    monitor = make_monitor(settings, rule)
+    monitor.store.read_active.side_effect = [
+        [
+            {"profile_id": "ops", "email_addresses": ["ops@example.com"]},
+            {"profile_id": "data", "email_addresses": ["data@example.com"]},
+        ],
+        [rule.model_dump()],
+    ]
+    monitor.state.save_report.side_effect = [RuntimeError(), None]
+    result = monitor.run("report-failure", datetime.now(UTC), preview=False)
+    assert [item["status"] for item in result["notifications"]] == ["FAILED", "SENT"]
+    monitor.sender.send.assert_called_once()
+    assert monitor.state.checkpoint.call_count == 2
+
+
+def test_partial_results_survive_run_budget_expiry(settings, rule, monkeypatch):
+    monitor = make_monitor(settings, rule)
+    second = rule.model_copy(update={"rule_id": "orders-two"})
+    monitor.store.read_active.side_effect = [
+        [{"profile_id": "ops", "email_addresses": ["ops@example.com"]}],
+        [rule.model_dump(), second.model_dump()],
+    ]
+    # Start, first rule, check start/end, then the second-rule deadline.
+    monkeypatch.setattr("src.engine.time.monotonic", Mock(side_effect=[0, 1, 1, 2, 2000]))
+    with pytest.raises(TimeoutError):
+        monitor.run("budget", datetime.now(UTC))
+    assert len(monitor.store.save_results.call_args.args[0]) == 1
+    assert monitor.state.finish.call_args.args[1]["rule_count"] == 1

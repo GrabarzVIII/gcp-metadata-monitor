@@ -1,6 +1,7 @@
 """BigQuery metadata storage and bounded, read-only scalar queries."""
 
 import json
+import logging
 from datetime import datetime
 from decimal import Decimal
 from numbers import Real
@@ -11,6 +12,8 @@ from google.cloud import bigquery
 from src.checks import build_query
 from src.config import Settings
 from src.models import Result, Rule
+
+logger = logging.getLogger(__name__)
 
 
 class BigQueryStore:
@@ -29,7 +32,7 @@ class BigQueryStore:
             ),
             timeout=30,
         )
-        rows = [dict(row) for row in job.result(timeout=self.settings.query_timeout_seconds)]
+        rows = [dict(row) for row in self._result(job)]
         for row in rows:
             if isinstance(row.get("check_config"), str):
                 row["check_config"] = json.loads(row["check_config"])
@@ -57,21 +60,27 @@ class BigQueryStore:
         config.dry_run = False
         config.labels = {"application": "gcp-metadata-monitor"}
         job = self.client.query(sql, job_config=config, location=rule.location, timeout=30)
+        rows = self._result(job, max_results=2)
+        if len(rows.schema) != 1 or rows.schema[0].name != "value":
+            raise ValueError("KPI query must return exactly one column named value")
+        values = list(rows)
+        if len(values) != 1:
+            raise ValueError("KPI query must return exactly one row (use NULL for no data)")
+        value = values[0][0]
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
+            raise ValueError("KPI value must be numeric")
+        return float(value)
+
+    def _result(self, job: Any, **kwargs: Any) -> Any:
         try:
-            rows = job.result(timeout=self.settings.query_timeout_seconds, max_results=2)
-            if len(rows.schema) != 1 or rows.schema[0].name != "value":
-                raise ValueError("KPI query must return exactly one column named value")
-            values = list(rows)
-            if len(values) != 1:
-                raise ValueError("KPI query must return exactly one row (use NULL for no data)")
-            value = values[0][0]
-            if value is None:
-                return None
-            if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
-                raise ValueError("KPI value must be numeric")
-            return float(value)
+            return job.result(timeout=self.settings.query_timeout_seconds, **kwargs)
         except TimeoutError:
-            job.cancel()
+            try:
+                job.cancel(timeout=10)
+            except Exception as exc:
+                logger.warning("job_cancel_failed error_type=%s", type(exc).__name__)
             raise
 
     def save_results(self, results: list[Result]) -> None:
@@ -88,6 +97,7 @@ class BigQueryStore:
             f"{self.settings.dataset_id}.{table}",
             location=self.settings.bq_location,
             job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+            job_id=f"monitor_{table}_{records[0]['run_id']}",
             timeout=30,
         )
-        job.result(timeout=self.settings.query_timeout_seconds)
+        self._result(job)

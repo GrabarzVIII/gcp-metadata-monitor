@@ -64,6 +64,8 @@ class Rule(BaseModel):
 
 
 class Profile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     profile_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
     email_addresses: list[str] = Field(min_length=1)
     only_problems: bool = False

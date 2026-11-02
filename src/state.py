@@ -35,6 +35,10 @@ class RunState:
         return None
 
     def finish(self, run_id: str, record: dict) -> None:
+        self.checkpoint(run_id, record)
+
+    def checkpoint(self, run_id: str, record: dict) -> None:
+        """Keep the latest delivery evidence on the exclusively owned run claim."""
         blob = self.bucket.blob(f"runs/{run_id}.json")
         blob.upload_from_string(json.dumps(record), content_type="application/json", timeout=30)
 

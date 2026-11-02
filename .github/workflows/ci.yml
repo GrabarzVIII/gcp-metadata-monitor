@@ -21,36 +21,27 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: constraints.txt
-      - run: python -m pip install -c constraints.txt -e ".[dev]"
-      - run: ruff check src tests scripts
-      - run: ruff format --check src tests scripts
+          cache-dependency-path: 'requirements*.txt'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip check
+      - run: ruff check main.py src tests
+      - run: ruff format --check main.py src tests
       - run: python -m pytest -q
       - run: python -m src.cli validate examples/rules.json
       - run: python -m src.cli demo
-      - run: python scripts/generate_schemas.py
-      - run: git diff --exit-code -- sql
       - uses: actions/upload-artifact@v4
         with:
           name: demo-${{ matrix.os }}-${{ matrix.python }}
           path: reports/demo
 
-  terraform:
+  function-source:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/setup-python@v5
         with:
-          terraform_version: '1.14.0'
-      - run: terraform fmt -check -recursive terraform
-      - run: terraform -chdir=terraform init -backend=false -input=false
-      - run: terraform -chdir=terraform validate
-      - run: terraform -chdir=terraform/bootstrap init -backend=false -input=false
-      - run: terraform -chdir=terraform/bootstrap validate
-
-  container:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t gcp-monitor:ci .
-      - run: docker run --rm gcp-monitor:ci python -m src.cli demo --output /tmp/demo
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - name: Verify function loading without cloud credentials
+        run: |
+          python -c "import functions_framework; app = functions_framework.create_app('run_monitoring', 'main.py'); assert app.test_client().get('/healthz').json == {'status': 'ok'}"
