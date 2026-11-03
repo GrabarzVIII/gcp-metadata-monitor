@@ -8,12 +8,9 @@ import functions_framework
 from flask import Request, jsonify
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StrictBool, ValidationError
 
-from src.bq_client import BigQueryStore
-from src.config import get_settings
-from src.engine import Monitor
-from src.logging_client import LogChecks
-from src.notification import EmailSender
-from src.state import RunAlreadyClaimed, RunState
+from config import get_settings
+from monitor import BigQueryStore, LogChecks, Monitor, RunAlreadyClaimed, RunState
+from report import EmailSender
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

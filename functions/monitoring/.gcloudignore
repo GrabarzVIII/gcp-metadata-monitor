@@ -1,8 +1,10 @@
 # Only runtime source and dependencies are uploaded by gcloud.
 *
 !main.py
+!config.py
+!monitor.py
+!report.py
 !requirements.txt
-!src/
-!src/**
+!daily_report.html
 **/__pycache__/**
 **/*.pyc
