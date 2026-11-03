@@ -13,19 +13,23 @@ sql/
 functions/
   monitoring/                       Upload THIS folder as ONE Cloud Run function
     main.py                         Entry point: run_monitoring
+    config.py                       Environment settings and rule validation
+    monitor.py                      Log/SQL checks, history, and run coordination
+    report.py                       HTML rendering and SMTP delivery
+    daily_report.html               Email template
     requirements.txt                Python dependencies installed by GCP
-    src/                            Internal modules used by the same function
-      templates/daily_report.html   Email template
 ```
 
 | Repository path | Action | Destination |
 |---|---|---|
-| `functions/monitoring/` | Deploy the entire folder, including `src/` and its template | One Cloud Run function in the main project |
+| `functions/monitoring/` | Deploy the entire folder: four Python files, the HTML template, and requirements | One Cloud Run function in the main project |
 | `sql/create_monitoring_tables.sql` | Edit its configuration declarations and execute the complete script | BigQuery in the main project |
 | `sql/inserts/` | Run the profile INSERT, then only the check INSERTs you need | Existing metadata tables in the main project |
 | `README.md` | Follow the setup, IAM, configuration, and invocation instructions | Operator documentation |
 
-**Do not deploy the repository root or individual files from `src/` as separate functions.** The source directory must have `main.py` and `requirements.txt` at its root. For a source ZIP, zip the **contents** of `functions/monitoring/`, preserving `src/`; do not add an outer `functions/monitoring/` directory inside the ZIP.
+**Deploy the entire `functions/monitoring/` folder as one function.** All runtime files are at the same level. For a source ZIP, zip the **contents** of that folder so `main.py` and `requirements.txt` are at the ZIP root; do not add an outer `functions/monitoring/` directory inside the ZIP.
+
+The function uses ordinary imports between neighboring Python files. No package directory or `__init__.py` file is needed. `main.py` handles HTTP requests, `config.py` validates settings and rules, `monitor.py` performs checks and records results, and `report.py` prepares and sends reports.
 
 Only one function is required. Cloud Scheduler calls it; Scheduler, BigQuery, Storage, and Secret Manager are supporting GCP resources, not additional function folders. No stored procedures are required. KPI rules execute a single SELECT directly.
 
