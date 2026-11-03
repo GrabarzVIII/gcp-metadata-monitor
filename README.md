@@ -67,21 +67,19 @@ gcloud config set project "$MAIN_PROJECT"
 
 ### Exact IAM role matrix (per service account)
 
-Grant the following roles to the **named service account**, at the **specified resource scope**. The three accounts have different purposes; do not give the Builder or Scheduler the Runtime account's data permissions. "Conditional" means the role is needed only if the corresponding monitoring feature is enabled.
+Each **(service account, IAM role)** pair appears only once in the table. A role listed with multiple resources still requires a **separate IAM binding on each listed resource**; grouping scopes in one row does not widen access to the whole project. Use `RUNTIME_SA`, `BUILDER_SA`, and `SCHEDULER_SA` as defined in section 2. The three accounts have different purposes; do not give Builder or Scheduler Runtime's data permissions. "Conditional" means the role is needed only if the corresponding feature is enabled. Replace `monitoring` with your actual metadata dataset name when applicable.
 
-| Service account (principal) | IAM role | Grant on | Required for |
+| Service account | IAM role | Grant on (each resource separately) | Required for |
 |---|---|---|---|
-| `RUNTIME_SA` (`gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/bigquery.jobUser` | **MAIN_PROJECT** (project) | Always: creates and bills BigQuery query/load jobs here |
-| `RUNTIME_SA` | `roles/bigquery.dataViewer` | **MAIN_PROJECT.monitoring** (metadata dataset) | Always: reads `monitoring_rules` and `notification_profiles`; replace `monitoring` if configured differently |
-| `RUNTIME_SA` | `roles/bigquery.dataEditor` | **MAIN_PROJECT.monitoring.monitoring_results** (table) | Always: appends check results |
-| `RUNTIME_SA` | `roles/bigquery.dataEditor` | **MAIN_PROJECT.monitoring.monitoring_runs** (table) | Always: appends run history |
-| `RUNTIME_SA` | `roles/storage.objectUser` | **gs://STATE_BUCKET** (bucket) | Always: creates, reads, and updates execution state and reports |
-| `RUNTIME_SA` | `roles/logging.viewer` | **Each project with monitored logs** | Conditional: ordinary `LOG` checks, including Cloud Run/Scheduler/Workflows/Dataform log checks |
-| `RUNTIME_SA` | `roles/logging.privateLogViewer` | **Each project whose private logs are monitored** | Conditional: Data Access/private logs; **use instead of** `roles/logging.viewer` for that project (it includes ordinary log access) |
-| `RUNTIME_SA` | `roles/bigquery.dataViewer` | **Each source dataset or individual source table** in a monitored project | Conditional: `SQL_KPI`, `FRESHNESS`, `ROW_COUNT`, `NULL_RATE`, `DUPLICATES` |
-| `RUNTIME_SA` | `roles/secretmanager.secretAccessor` | **gcp-monitor-smtp-password** (one Secret Manager secret in MAIN_PROJECT) | Conditional: SMTP password provided through Secret Manager |
-| `BUILDER_SA` (`gcp-monitor-builder@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/run.builder` | **MAIN_PROJECT** (project) | Always for source deployment using `--build-service-account` |
-| `SCHEDULER_SA` (`gcp-monitor-scheduler@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/run.invoker` | **Deployed Cloud Run function/service only** | Required to call the function from Cloud Scheduler; grant after deployment |
+| `RUNTIME_SA` | `roles/bigquery.jobUser` | **MAIN_PROJECT** (project) | Always: creates BigQuery query/load jobs |
+| `RUNTIME_SA` | `roles/bigquery.dataViewer` | **MAIN_PROJECT.monitoring** (metadata dataset); **each source dataset or individual source table** in monitored projects | Metadata: always, for reading rules/profiles; sources: only for `SQL_KPI`, `FRESHNESS`, `ROW_COUNT`, `NULL_RATE`, `DUPLICATES` |
+| `RUNTIME_SA` | `roles/bigquery.dataEditor` | **MAIN_PROJECT.monitoring.monitoring_results** and **MAIN_PROJECT.monitoring.monitoring_runs** (two separate table grants) | Always: append monitoring results and run history |
+| `RUNTIME_SA` | `roles/storage.objectUser` | **gs://STATE_BUCKET** (bucket) | Always: create/read/update execution state and reports |
+| `RUNTIME_SA` | `roles/logging.viewer` | **Each project with ordinary monitored logs** | Conditional: `LOG` checks |
+| `RUNTIME_SA` | `roles/logging.privateLogViewer` | **Each project whose private logs are monitored** | Conditional: Data Access/private logs; use **instead of** `roles/logging.viewer` in that project |
+| `RUNTIME_SA` | `roles/secretmanager.secretAccessor` | **gcp-monitor-smtp-password** (single secret in MAIN_PROJECT) | Conditional: SMTP password through Secret Manager |
+| `BUILDER_SA` | `roles/run.builder` | **MAIN_PROJECT** (project) | Source deployment with `--build-service-account` |
+| `SCHEDULER_SA` | `roles/run.invoker` | **Deployed Cloud Run function/service** | Scheduled invocation; grant after deployment |
 
 **Where to assign roles:** Runtime's BigQuery job role and Builder's build role belong to the **main project**; read roles for external datasets and logs belong to the **monitored resources** (which may also be in the main project). The Scheduler invoker role belongs on the **Cloud Run service**, not on every service in the project. A source project does **not** need `roles/bigquery.jobUser` for this application because its jobs execute in MAIN_PROJECT. Follow sections 5–7 for exact `gcloud` and SQL grants.
 
@@ -147,8 +145,7 @@ All rows below apply to **RUNTIME_SA**. Assign roles at the listed scope, not in
 |---|---|---|
 | `roles/bigquery.jobUser` | Main project | Start metadata queries, source KPI queries, and result load jobs |
 | `roles/bigquery.dataViewer` | Metadata dataset | Read rules/profiles and existing table definitions |
-| `roles/bigquery.dataEditor` | Table `monitoring_results` | Write evaluated results |
-| `roles/bigquery.dataEditor` | Table `monitoring_runs` | Write run history |
+| `roles/bigquery.dataEditor` | Tables `monitoring_results` **and** `monitoring_runs` (grant on each table) | Write evaluated results and run history |
 | `roles/storage.objectUser` | State bucket only | Create/read execution claims and write private reports |
 | `roles/secretmanager.secretAccessor` | SMTP password secret only | Read SMTP credentials; needed when email delivery is enabled |
 
