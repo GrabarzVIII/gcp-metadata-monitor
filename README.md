@@ -9,6 +9,7 @@ README.md                           Deployment and permissions manual
 LICENSE                             MIT license
 sql/
   create_monitoring_tables.sql      Creates the metadata dataset and four tables
+  inserts/                          Ready-to-edit INSERT scripts for profiles and checks
 functions/
   monitoring/                       Upload THIS folder as ONE Cloud Run function
     main.py                         Entry point: run_monitoring
@@ -21,6 +22,7 @@ functions/
 |---|---|---|
 | `functions/monitoring/` | Deploy the entire folder, including `src/` and its template | One Cloud Run function in the main project |
 | `sql/create_monitoring_tables.sql` | Edit its configuration declarations and execute the complete script | BigQuery in the main project |
+| `sql/inserts/` | Run the profile INSERT, then only the check INSERTs you need | Existing metadata tables in the main project |
 | `README.md` | Follow the setup, IAM, configuration, and invocation instructions | Operator documentation |
 
 **Do not deploy the repository root or individual files from `src/` as separate functions.** The source directory must have `main.py` and `requirements.txt` at its root. For a source ZIP, zip the **contents** of `functions/monitoring/`, preserving `src/`; do not add an outer `functions/monitoring/` directory inside the ZIP.
@@ -199,43 +201,50 @@ Add the Scheduler invoker grant after deploying the function (step 11). Neither 
 
 ## 8. Add a profile and a monitoring rule
 
-The tables start empty. Use the BigQuery editor in the main project to add your configuration. Replace all sample project IDs and email addresses in the SQL below. These MERGE statements create examples only when their IDs are absent; rerunning them does not overwrite existing configuration.
+The tables start empty. **[sql/inserts/](sql/inserts/)** contains independent, complete BigQuery scripts. Add a recipient profile first, then run only the check scripts you need; there is no requirement to enable every example.
 
-```sql
-MERGE `MAIN_PROJECT.monitoring.notification_profiles` AS target
-USING (SELECT 'data-team' AS profile_id) AS example
-ON target.profile_id = example.profile_id
-WHEN NOT MATCHED THEN
-  INSERT (profile_id, email_addresses, only_problems, is_active)
-  VALUES (example.profile_id, ['team@example.com'], FALSE, FALSE);
+| Script | Creates | Example alarm condition |
+|---|---|---|
+| [01_notification_profile.sql](sql/inserts/01_notification_profile.sql) | One profile with one or more email addresses | Optional report filtering through `only_problems` |
+| [02_log_rule.sql](sql/inserts/02_log_rule.sql) | A Cloud Run log check | More than zero matching error entries in 24 hours |
+| [03_sql_kpi_rule.sql](sql/inserts/03_sql_kpi_rule.sql) | A custom SQL KPI | More than 5% of orders without a customer ID |
+| [04_freshness_rule.sql](sql/inserts/04_freshness_rule.sql) | A data freshness check | Latest load older than 120 minutes |
+| [05_row_count_rule.sql](sql/inserts/05_row_count_rule.sql) | A record-count check | Fewer than 100 records in 24 hours |
+| [06_null_rate_rule.sql](sql/inserts/06_null_rate_rule.sql) | A NULL-rate template check | More than 5% NULL customer IDs |
+| [07_duplicates_rule.sql](sql/inserts/07_duplicates_rule.sql) | A duplicate-key check | Any excess rows for an order ID |
 
-MERGE `MAIN_PROJECT.monitoring.monitoring_rules` AS target
-USING (SELECT 'orders-count' AS rule_id) AS example
-ON target.rule_id = example.rule_id
-WHEN NOT MATCHED THEN INSERT (
-  rule_id, rule_name, project_id, service_type, resource_name, resource_url,
-  location, check_type, kpi_query, comparison_operator, threshold_value,
-  window_minutes, target_profiles, owner, is_active
-)
-VALUES (
-  example.rule_id, 'Orders received in the last 24 hours',
-  'MONITORED_PROJECT', 'BIGQUERY', 'warehouse.orders',
-  'https://console.cloud.google.com/bigquery?project=MONITORED_PROJECT',
-  'EU', 'SQL_KPI',
-  '''SELECT COUNT(*) AS value FROM `MONITORED_PROJECT.warehouse.orders`
-     WHERE created_at >= @window_start AND created_at < @window_end''',
-  'LT', 100, 1440, ['data-team'], 'Data Platform', FALSE
-);
+Before running a script:
+
+1. Replace `MAIN_PROJECT` and, if different, the `monitoring` metadata dataset in **both** destination table references.
+2. Choose a unique `new_profile_id` or `new_rule_id` in the DECLARE statement. To add another check of the same type, copy the script and change that ID.
+3. Replace `your-source-project`, source table/service, column names, region, URLs, recipients, and owner with real values. The `project_id` in a rule identifies the monitored project, not the main project.
+4. Set `target_profiles` (for example `['data-team']`) to existing profile IDs. Multiple IDs route the same result to multiple profiles.
+5. Review the alarm operator, threshold, time window, and no-data policy. For BigQuery checks, set `location` to the **source** dataset location and use TIMESTAMP columns.
+
+Execute the whole selected script, including its DECLARE statement, in the **main metadata dataset's location**. In Cloud Shell, after editing a file:
+
+```bash
+bq query --project_id="$MAIN_PROJECT" --location="$BQ_LOCATION" \
+  --use_legacy_sql=false < sql/inserts/01_notification_profile.sql
+
+bq query --project_id="$MAIN_PROJECT" --location="$BQ_LOCATION" \
+  --use_legacy_sql=false < sql/inserts/05_row_count_rule.sql
 ```
 
-Set the rule's `location` to the source dataset location and ensure `created_at` is a TIMESTAMP. After review, enable both records:
+The files use INSERT ... SELECT ... WHERE NOT EXISTS. Sequential reruns skip an existing ID and do not change its configuration. This is not an atomic uniqueness guarantee for concurrent writers; do not submit simultaneous inserts for the same ID. Use an explicit UPDATE to edit an existing rule and increment `rule_version`.
+
+Every example starts with `is_active = FALSE`. After reviewing the inserted values, enable the selected profile and rule (adapt the IDs if you changed them):
 
 ```sql
 UPDATE `MAIN_PROJECT.monitoring.notification_profiles`
 SET is_active = TRUE WHERE profile_id = 'data-team';
 UPDATE `MAIN_PROJECT.monitoring.monitoring_rules`
-SET is_active = TRUE WHERE rule_id = 'orders-count';
+SET is_active = TRUE WHERE rule_id = 'orders-row-count';
 ```
+
+Then invoke the function with `{"preview":true}` as described in step 9. Preview evaluates active rules; it does not evaluate disabled drafts. Keep email delivery disabled until you have inspected the report. The SQL_KPI and NULL_RATE examples illustrate two ways to check the same condition, so normally choose one of them.
+
+To monitor a **new project or service**, grant the source access described in step 6 and insert a rule pointing to that resource. There is no separate project-registration table. For Scheduler, Workflows, or Dataform logs, adapt the LOG template's `service_type` and use a resource-specific filter verified in Logs Explorer. Do not insert manually into `monitoring_results` or `monitoring_runs`; the function writes those history tables.
 
 One row represents one check. IDs must be unique, referenced profiles must be active, and only explicit `is_active = TRUE` rows are evaluated. Configuration authors are trusted operators because SQL executes with the runtime's data access.
 
@@ -418,6 +427,6 @@ Windows are rolling, not previous local calendar days. A 1,440-minute window wit
 
 History-table partitions default to 90 days. Configure private report retention separately from execution claims; deleting claims shortens the deduplication horizon. GCP builds, BigQuery, runtime requests, Storage, Secret Manager, and SMTP may incur costs.
 
-To update code, redeploy the same function folder and run a preview. Existing installations managed outside this manual require an explicit ownership/migration decision before changing them. This repository contains deployable function source, object-creation SQL, and documentation; development tests and CI configuration are not part of the deployment package. Live SQL, IAM, builds, and SMTP must be verified in your own project.
+To update code, redeploy the same function folder and run a preview. Existing installations managed outside this manual require an explicit ownership/migration decision before changing them. This repository contains deployable function source, object-creation/configuration SQL, and documentation; development tests and CI configuration are not part of the deployment package. Live SQL, IAM, builds, and SMTP must be verified in your own project.
 
 MIT license; see [LICENSE](LICENSE).
