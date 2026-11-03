@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from datetime import UTC, datetime, timedelta
@@ -10,14 +11,15 @@ from decimal import Decimal
 from numbers import Real
 from time import monotonic
 from typing import Any
+from urllib.parse import urlparse
 
-from config import evaluate, validate_profile, validate_rule
 from google.api_core.exceptions import PreconditionFailed
 from google.cloud import bigquery, storage
 from google.cloud.logging_v2.services.logging_service_v2 import LoggingServiceV2Client
 from report import render_report, send_email
 
 logger = logging.getLogger(__name__)
+ID_PATTERN = r"[A-Za-z0-9_-]{1,128}"
 
 
 def identifier(value: str, *, table: bool = False) -> str:
@@ -389,6 +391,166 @@ def read_profiles(settings: dict, client: Any) -> dict[str, dict]:
     if len({profile["profile_id"] for profile in profiles}) != len(profiles):
         raise ValueError("Duplicate profile_id values in metadata")
     return {profile["profile_id"]: profile for profile in profiles}
+
+
+def _require_string(value, name: str, pattern: str | None = None) -> None:
+    if not isinstance(value, str) or (pattern and not re.fullmatch(pattern, value)):
+        raise ValueError(f"Invalid {name}")
+
+
+def _require_integer(value, name: str) -> None:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"Invalid {name}")
+
+
+def _require_boolean(value, name: str) -> None:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+
+
+def _require_choice(value, name: str, choices: tuple) -> None:
+    if value not in choices:
+        raise ValueError(f"Invalid {name}")
+
+
+def _require_string_list(value, name: str) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a list of strings")
+
+
+def _finite_number(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
+        raise ValueError(f"{name} must be numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def _with_defaults(data: dict, defaults: dict, required: tuple) -> dict:
+    """Reject misspelled and missing fields before applying per-call defaults."""
+    if not isinstance(data, dict) or set(data) - (defaults.keys() | set(required)):
+        raise ValueError("Unexpected metadata fields")
+    if set(required) - data.keys():
+        raise ValueError("Missing required metadata fields")
+    return {**defaults, **data}
+
+
+def validate_rule(data: dict) -> dict:
+    rule = _with_defaults(
+        data,
+        {
+            "rule_version": 1,
+            "resource_id": "",
+            "resource_url": "",
+            "location": "EU",
+            "log_filter": None,
+            "kpi_query": None,
+            "check_config": {},
+            "threshold_upper": None,
+            "window_minutes": 1440,
+            "severity": "WARNING",
+            "no_data_policy": "NO_DATA",
+            "target_profiles": [],
+            "pipeline_id": "",
+            "owner": "",
+            "runbook_url": "",
+            "is_active": True,
+        },
+        (
+            "rule_id",
+            "rule_name",
+            "project_id",
+            "service_type",
+            "resource_name",
+            "check_type",
+            "comparison_operator",
+            "threshold_value",
+        ),
+    )
+    _require_string(rule["rule_id"], "rule_id", ID_PATTERN)
+    _require_string(rule["project_id"], "project_id", r"[a-z][a-z0-9-]{4,61}[a-z0-9]")
+    for key in (
+        "rule_name",
+        "resource_name",
+        "resource_id",
+        "resource_url",
+        "location",
+        "pipeline_id",
+        "owner",
+        "runbook_url",
+    ):
+        _require_string(rule[key], key)
+    if not rule["rule_name"]:
+        raise ValueError("rule_name must not be empty")
+    for key in ("rule_version", "window_minutes"):
+        _require_integer(rule[key], key)
+    _require_boolean(rule["is_active"], "is_active")
+    _require_string_list(rule["target_profiles"], "target_profiles")
+    for key, choices in (
+        ("service_type", ("CLOUD_RUN", "SCHEDULER", "WORKFLOWS", "DATAFORM", "BIGQUERY")),
+        ("check_type", ("LOG", "SQL_KPI", "FRESHNESS", "ROW_COUNT", "NULL_RATE", "DUPLICATES")),
+        ("comparison_operator", ("GT", "GE", "LT", "LE", "EQ", "NE", "OUTSIDE_RANGE")),
+        ("severity", ("INFO", "WARNING", "CRITICAL")),
+        ("no_data_policy", ("ALERT", "NO_DATA", "OK")),
+    ):
+        _require_choice(rule[key], key, choices)
+    if not isinstance(rule["check_config"], dict):
+        raise ValueError("check_config must be an object")
+    for key in ("log_filter", "kpi_query"):
+        if rule[key] is not None:
+            _require_string(rule[key], key)
+    for key in ("resource_url", "runbook_url"):
+        url = urlparse(rule[key])
+        if rule[key] and (url.scheme != "https" or not url.netloc):
+            raise ValueError("Links must be absolute HTTPS URLs")
+    rule["threshold_value"] = _finite_number(rule["threshold_value"], "threshold_value")
+    if rule["threshold_upper"] is not None:
+        rule["threshold_upper"] = _finite_number(rule["threshold_upper"], "threshold_upper")
+    if rule["check_type"] == "LOG" and not (rule["log_filter"] or "").strip():
+        raise ValueError("LOG checks require a resource-scoped log_filter")
+    if rule["check_type"] == "SQL_KPI" and not (rule["kpi_query"] or "").strip():
+        raise ValueError("SQL_KPI checks require kpi_query")
+    if rule["comparison_operator"] == "OUTSIDE_RANGE" and (
+        rule["threshold_upper"] is None or rule["threshold_upper"] < rule["threshold_value"]
+    ):
+        raise ValueError("OUTSIDE_RANGE requires threshold_upper >= threshold_value")
+    return rule
+
+
+def validate_profile(data: dict) -> dict:
+    profile = _with_defaults(
+        data, {"only_problems": False, "is_active": True}, ("profile_id", "email_addresses")
+    )
+    _require_string(profile["profile_id"], "profile_id", ID_PATTERN)
+    _require_string_list(profile["email_addresses"], "email_addresses")
+    if not profile["email_addresses"]:
+        raise ValueError("At least one email address is required")
+    for address in profile["email_addresses"]:
+        if "@" not in address or any(c in address for c in "\r\n,;"):
+            raise ValueError("Each recipient must be a single email address")
+    for key in ("only_problems", "is_active"):
+        _require_boolean(profile[key], key)
+    return profile
+
+
+def evaluate(value: float | None, rule: dict) -> tuple[str, str]:
+    """Interpret thresholds as alarm conditions, never as success conditions."""
+    if value is None:
+        return rule["no_data_policy"], "No data returned; applied no_data_policy."
+    if not math.isfinite(value):
+        raise ValueError("KPI returned a non-finite value")
+    threshold = rule["threshold_value"]
+    alarm = {
+        "GT": lambda: value > threshold,
+        "GE": lambda: value >= threshold,
+        "LT": lambda: value < threshold,
+        "LE": lambda: value <= threshold,
+        "EQ": lambda: value == threshold,
+        "NE": lambda: value != threshold,
+        "OUTSIDE_RANGE": lambda: value < threshold or value > rule["threshold_upper"],
+    }[rule["comparison_operator"]]()
+    return ("ALERT", "Alarm condition met.") if alarm else ("OK", "Check passed.")
 
 
 def create_clients(settings: dict) -> dict:
