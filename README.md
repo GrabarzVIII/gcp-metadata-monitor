@@ -1,195 +1,329 @@
-# GCP Metadata Monitor
+# GCP Metadata Monitor — deployment manual
 
-[![CI](https://github.com/GrabarzVIII/gcp-metadata-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/GrabarzVIII/gcp-metadata-monitor/actions/workflows/ci.yml)
+A metadata-driven monitoring system deployed as **one HTTP Cloud Run function** in a central GCP project. The same function reads logs and checks BigQuery data in other projects, saves results, and sends HTML reports to configured email profiles.
 
-A Python **Cloud Run function** that reads monitoring rules from BigQuery, checks logs and data quality across GCP projects, and produces HTML reports for configured recipient profiles. Deploy directly from source with `gcloud run deploy --source . --function run_monitoring`.
+## 1. What to deploy and what to run
 
-The repository contains the function, SQL scripts, tests, and this deployment manual. Google builds the runtime using managed buildpacks; you do not maintain a Dockerfile, build pipeline, or Terraform stack.
+```text
+README.md                           Deployment and permissions manual
+LICENSE                             MIT license
+sql/
+  create_monitoring_tables.sql      Creates the metadata dataset and four tables
+functions/
+  monitoring/                       Upload THIS folder as ONE Cloud Run function
+    main.py                         Entry point: run_monitoring
+    requirements.txt                Python dependencies installed by GCP
+    src/                            Internal modules used by the same function
+      templates/daily_report.html   Email template
+```
 
-## Supported checks
+| Repository path | Action | Destination |
+|---|---|---|
+| `functions/monitoring/` | Deploy the entire folder, including `src/` and its template | One Cloud Run function in the main project |
+| `sql/create_monitoring_tables.sql` | Edit its configuration declarations and execute the complete script | BigQuery in the main project |
+| `README.md` | Follow the setup, IAM, configuration, and invocation instructions | Operator documentation |
 
-| Check | Observation |
+**Do not deploy the repository root or individual files from `src/` as separate functions.** The source directory must have `main.py` and `requirements.txt` at its root. For a source ZIP, zip the **contents** of `functions/monitoring/`, preserving `src/`; do not add an outer `functions/monitoring/` directory inside the ZIP.
+
+Only one function is required. Cloud Scheduler calls it; Scheduler, BigQuery, Storage, and Secret Manager are supporting GCP resources, not additional function folders. No stored procedures are required. KPI rules execute a single SELECT directly.
+
+## 2. Projects and service accounts
+
+Use these names throughout the manual, replacing the example values:
+
+| Name | Meaning |
 |---|---|
-| LOG | Number of entries matching a resource-scoped Cloud Logging filter |
-| SQL_KPI | A numeric scalar returned by your SELECT query |
-| FRESHNESS | Minutes since the latest data timestamp |
-| ROW_COUNT | Number of records in the observation window |
-| NULL_RATE | Fraction of records missing a specified value |
-| DUPLICATES | Number of excess rows for a configured key |
+| Main project | Hosts the function, metadata tables, state bucket, SMTP secret, and Scheduler job; pays for BigQuery query jobs |
+| Monitored project | Contains logs or source BigQuery datasets to read; repeat source grants for every such project |
+| Runtime account | `gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com`; selected as the function's execution identity |
+| Builder account | `gcp-monitor-builder@MAIN_PROJECT.iam.gserviceaccount.com`; used only to build source |
+| Scheduler account | `gcp-monitor-scheduler@MAIN_PROJECT.iam.gserviceaccount.com`; used only to invoke the function |
 
-A rule identifies the project, service type, resource name/link, check type, alarm comparison, threshold, and recipient profiles. Results distinguish **OK, ALERT, ERROR, and NO_DATA**. See [the rule reference](docs/RULES.md).
+**Grant access in monitored projects to the runtime account from the main project.** Do not create a new runtime account in every monitored project or download account keys.
 
-Service labels such as DATAFORM or WORKFLOWS do not imply native execution-status APIs. Use resource-scoped logs or SQL checks in this version. Metric adapters, business calendars, incident lifecycles, and per-rule schedules remain future work.
-
-```mermaid
-flowchart LR
-    Scheduler[Cloud Scheduler] -->|OIDC POST| Function[Cloud Run function]
-    Config[(BigQuery rules and profiles)] --> Function
-    Function --> Logs[Cloud Logging]
-    Function --> SQL[BigQuery SELECT queries]
-    Function --> Results[(BigQuery results and run history)]
-    Function --> State[(Private Storage claims and reports)]
-    Secrets[Secret Manager] --> Function
-    Function --> SMTP[SMTP over TLS]
-```
-
-## Local setup
-
-Use Python 3.11 or 3.12. Cloud deployment below uses Python 3.12.
+Commands below use Bash in Google Cloud Shell, from the repository root. Install a current Google Cloud CLI if working locally. The deployment runtime is Python 3.12.
 
 ```bash
-git clone https://github.com/GrabarzVIII/gcp-metadata-monitor.git
-cd gcp-metadata-monitor
-python -m venv .venv
-```
-
-Activate with `.venv/Scripts/Activate.ps1` in PowerShell or `source .venv/bin/activate` on Linux/macOS. If PowerShell blocks activation, call `.\.venv\Scripts\python.exe` directly instead of changing the machine's execution policy.
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-python -m src.cli demo
-```
-
-Open `reports/demo/daily_report.html`. This synthetic demo needs no cloud credentials and sends no email. The intentional failed check is included to demonstrate ERROR handling.
-
-Run the real function locally:
-
-```bash
-functions-framework --target=run_monitoring --source=main.py --port=8080
-```
-
-`GET /healthz` does not initialize cloud clients. A POST to `/` with `{"preview":true}` evaluates live rules and therefore requires ADC and deployment settings. Copy `.env.example` to `.env` for local live testing. The local development server has no IAM authentication; keep it on a trusted machine.
-
-## Deployment manual
-
-The commands below are for **Bash / Google Cloud Shell**, from the repository root. Install a current Google Cloud CLI with Cloud Run function support. Use an existing project with billing enabled; replace every sample value with your own.
-
-### 1. Choose configuration and enable APIs
-
-```bash
-export PROJECT_ID="your-monitoring-project"
+export MAIN_PROJECT="your-monitoring-project"
 export REGION="europe-west1"
 export BQ_LOCATION="EU"
 export DATASET_ID="monitoring"
 export FUNCTION_NAME="gcp-metadata-monitor"
-export STATE_BUCKET="$PROJECT_ID-monitor-state"
-export RUNTIME_SA="gcp-monitor-runtime@$PROJECT_ID.iam.gserviceaccount.com"
-export BUILDER_SA="gcp-monitor-builder@$PROJECT_ID.iam.gserviceaccount.com"
-export SCHEDULER_SA="gcp-monitor-scheduler@$PROJECT_ID.iam.gserviceaccount.com"
+export STATE_BUCKET="$MAIN_PROJECT-monitor-state"
+export RUNTIME_SA="gcp-monitor-runtime@$MAIN_PROJECT.iam.gserviceaccount.com"
+export BUILDER_SA="gcp-monitor-builder@$MAIN_PROJECT.iam.gserviceaccount.com"
+export SCHEDULER_SA="gcp-monitor-scheduler@$MAIN_PROJECT.iam.gserviceaccount.com"
 
-gcloud auth login
-gcloud config set project "$PROJECT_ID"
+gcloud config set project "$MAIN_PROJECT"
+```
+
+The main project must have billing enabled. An administrator performs resource creation, API enablement, and IAM changes. These setup permissions are separate from the runtime account's permissions below. For source deployment, the deployer needs `roles/run.sourceDeveloper` and `roles/serviceusage.serviceUsageConsumer` in the main project, plus `roles/iam.serviceAccountUser` on the runtime and builder accounts. The Scheduler operator needs permission to create jobs and act as its Scheduler account. See [Google's deployment requirements](https://docs.cloud.google.com/run/docs/deploy-functions).
+
+## 3. Create the supporting resources in the main project
+
+Enable the required APIs and create the accounts once:
+
+```bash
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
   artifactregistry.googleapis.com bigquery.googleapis.com logging.googleapis.com \
   storage.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com \
-  iam.googleapis.com
+  iam.googleapis.com --project="$MAIN_PROJECT"
+
+gcloud iam service-accounts create gcp-monitor-runtime --project="$MAIN_PROJECT"
+gcloud iam service-accounts create gcp-monitor-builder --project="$MAIN_PROJECT"
+gcloud iam service-accounts create gcp-monitor-scheduler --project="$MAIN_PROJECT"
+
+gcloud storage buckets create "gs://$STATE_BUCKET" --project="$MAIN_PROJECT" \
+  --location="$REGION" --uniform-bucket-level-access --public-access-prevention
 ```
 
-Cloud Shell may already be authenticated. Local previews use `gcloud auth application-default login`. No service-account key files are needed.
+Reuse existing resources after checking their settings. Keep the state bucket private: it stores execution claims and reports. Google manages the build artifacts required for source deployment.
 
-An administrator must authorize initial setup: service-account creation, API enablement, resource creation, and IAM changes. Source deployment requires Cloud Run Source Developer, Service Usage Consumer, and permission to act as the runtime/build accounts. The operator creating Scheduler needs permission to act as its invoker account. See [Google's source deployment requirements](https://docs.cloud.google.com/run/docs/deploy-functions).
+## 4. Execute the table-creation SQL
 
-### 2. Create service accounts and a private state bucket
+Open **[sql/create_monitoring_tables.sql](sql/create_monitoring_tables.sql)** and set its first four declarations:
 
-For a new installation:
+| SQL variable | Example | Must match |
+|---|---|---|
+| `metadata_project` | `your-monitoring-project` | MAIN_PROJECT / GOOGLE_CLOUD_PROJECT |
+| `metadata_dataset` | `monitoring` | DATASET_ID / METADATA_DATASET |
+| `metadata_location` | `EU` | BigQuery editor query location / BQ_LOCATION |
+| `history_retention_days` | `90` | Your history retention requirement |
+
+Execute the **entire script** in the main project's BigQuery editor. Alternatively, after editing it:
 
 ```bash
-gcloud iam service-accounts create gcp-monitor-runtime --display-name="Monitoring runtime"
-gcloud iam service-accounts create gcp-monitor-builder --display-name="Function source builder"
-gcloud iam service-accounts create gcp-monitor-scheduler --display-name="Scheduler invoker"
+bq query --project_id="$MAIN_PROJECT" --location="$BQ_LOCATION" \
+  --use_legacy_sql=false < sql/create_monitoring_tables.sql
+```
 
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$BUILDER_SA" --role=roles/run.builder
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+This is the only SQL file required to create objects:
+
+| Created object | Purpose |
+|---|---|
+| Dataset `MAIN_PROJECT.monitoring` | Holds metadata and history; name is configurable |
+| `notification_profiles` | Recipient addresses and report filtering |
+| `monitoring_rules` | Projects, services, resources, links, check definitions, thresholds, routing |
+| `monitoring_results` | Observations and snapshots of evaluated rules |
+| `monitoring_runs` | Execution status, counts, and notification outcomes |
+
+The result/run tables are partitioned and clustered; their default retention is 90 days. The script uses IF NOT EXISTS and preserves existing objects. It does not change the schema, location, defaults, or retention of an existing table. Apply explicit migrations if updating an existing installation.
+
+## 5. Runtime permissions in the main project
+
+All rows below apply to **RUNTIME_SA**. Assign roles at the listed scope, not indiscriminately to the entire project.
+
+| Role | Scope in the main project | Why / when |
+|---|---|---|
+| `roles/bigquery.jobUser` | Main project | Start metadata queries, source KPI queries, and result load jobs |
+| `roles/bigquery.dataViewer` | Metadata dataset | Read rules/profiles and existing table definitions |
+| `roles/bigquery.dataEditor` | Table `monitoring_results` | Write evaluated results |
+| `roles/bigquery.dataEditor` | Table `monitoring_runs` | Write run history |
+| `roles/storage.objectUser` | State bucket only | Create/read execution claims and write private reports |
+| `roles/secretmanager.secretAccessor` | SMTP password secret only | Read SMTP credentials; needed when email delivery is enabled |
+
+```bash
+gcloud projects add-iam-policy-binding "$MAIN_PROJECT" \
   --member="serviceAccount:$RUNTIME_SA" --role=roles/bigquery.jobUser
 
-gcloud storage buckets create "gs://$STATE_BUCKET" --project="$PROJECT_ID" \
-  --location="$REGION" --uniform-bucket-level-access --public-access-prevention
 gcloud storage buckets add-iam-policy-binding "gs://$STATE_BUCKET" \
   --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectUser
 ```
 
-If resources already exist, inspect and reuse them rather than recreating them. Grant the deployer `roles/iam.serviceAccountUser` on the runtime/build accounts and the Scheduler operator that role on the Scheduler account when needed. Builder, runtime, and invoker identities have different duties.
+Run these SQL grants as an authorized administrator in the metadata location. Replace `MAIN_PROJECT` in both the resource names and account email; replace `monitoring` if you chose a different dataset:
 
-### 3. Create tables with SQL
+```sql
+GRANT `roles/bigquery.dataViewer`
+ON SCHEMA `MAIN_PROJECT.monitoring`
+TO 'serviceAccount:gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com';
 
-Edit the declarations at the top of [sql/01_tables.sql](sql/01_tables.sql), then run the full script in the BigQuery editor, selecting the matching query location. Alternatively, after editing:
+GRANT `roles/bigquery.dataEditor`
+ON TABLE `MAIN_PROJECT.monitoring.monitoring_results`
+TO 'serviceAccount:gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com';
 
-```bash
-bq query --project_id="$PROJECT_ID" --location="$BQ_LOCATION" \
-  --use_legacy_sql=false < sql/01_tables.sql
+GRANT `roles/bigquery.dataEditor`
+ON TABLE `MAIN_PROJECT.monitoring.monitoring_runs`
+TO 'serviceAccount:gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com';
 ```
 
-The script creates the dataset and these tables:
+The SMTP secret and its grant are configured in step 10. If the main project also contains monitored logs or source tables, apply the relevant source grants from the next section there too.
 
-| Table | Purpose |
-|---|---|
-| notification_profiles | Recipient addresses and report filtering |
-| monitoring_rules | Resource identity, check configuration, thresholds, routing |
-| monitoring_results | Observations and evaluated rule snapshots |
-| monitoring_runs | Run status, counts, and delivery outcomes |
+## 6. Runtime permissions in every monitored project
 
-The two history tables are partitioned and default to 90-day retention. The script is safe to rerun: existing tables are preserved. It does not migrate their schema or change existing partition retention. SQL is the schema source of truth; generated JSON schemas and stored procedures are not required. The function executes SELECT queries directly.
+Use the **same RUNTIME_SA email from the main project** in every grant.
 
-### 4. Grant runtime access to data and logs
+| Check being used | Role | Scope in each monitored project |
+|---|---|---|
+| LOG checks | `roles/logging.viewer` | Project whose log entries are queried |
+| Private logs, such as Data Access audit logs | `roles/logging.privateLogViewer` | Project; use only if selected filters require private logs; it includes ordinary log access |
+| SQL_KPI, FRESHNESS, ROW_COUNT, NULL_RATE, DUPLICATES | `roles/bigquery.dataViewer` | Each source dataset, or each explicitly selected source table |
 
-Adapt [sql/04_permissions.sql](sql/04_permissions.sql). Run the metadata grants in the metadata location; run each source-dataset grant separately in that dataset's location. The runtime can read metadata/source data and write only the two history tables. Do not give it write access to source datasets.
-
-For each project whose logs will be checked:
+For ordinary logs, repeat for each relevant project:
 
 ```bash
-export SOURCE_PROJECT="your-source-project"
-gcloud services enable logging.googleapis.com --project="$SOURCE_PROJECT"
-gcloud projects add-iam-policy-binding "$SOURCE_PROJECT" \
+export MONITORED_PROJECT="your-source-project"
+gcloud services enable logging.googleapis.com --project="$MONITORED_PROJECT"
+gcloud projects add-iam-policy-binding "$MONITORED_PROJECT" \
   --member="serviceAccount:$RUNTIME_SA" --role=roles/logging.viewer
 ```
 
-Private audit logs and restricted log views may need additional scoped grants. Organization policies and VPC Service Controls must allow the intended cross-project reads. BigQuery queries are billed to the hosting project; each rule's location must match its source data.
-
-### 5. Add rules and recipient profiles
-
-Edit the declarations in [sql/02_sample_data.sql](sql/02_sample_data.sql), then run it in the metadata location. It inserts example checks for volume, freshness, a SQL KPI, and service errors. Re-running it preserves existing records and does not create duplicates.
-
-Examples are disabled. Review the filters, source column types, recipient address, and thresholds before activation:
+For each source dataset, run this grant in that dataset's BigQuery location:
 
 ```sql
-UPDATE `your-monitoring-project.monitoring.notification_profiles`
+GRANT `roles/bigquery.dataViewer`
+ON SCHEMA `MONITORED_PROJECT.SOURCE_DATASET`
+TO 'serviceAccount:gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com';
+```
+
+Source BigQuery datasets must already exist. Source projects must have the relevant APIs enabled. The runtime account does not need API-administration permissions.
+
+**BigQuery Job User belongs in the main project**, where this implementation creates and bills jobs. It is not additionally needed in a monitored project solely to read its tables. Queries use fully qualified source table names. Source datasets do not receive write grants. See [BigQuery IAM roles](https://docs.cloud.google.com/bigquery/docs/access-control).
+
+Checks for Cloud Run, Scheduler, Workflows, and Dataform currently read their logs. They do not invoke those services or use their native execution-status APIs. No runtime `run.admin`, `workflows.invoker`, or `dataform.viewer` grant is required for these log checks. Custom log-view-only access, row-level security, policy-tag-protected columns, external tables, and remote functions can require additional configuration; review the actual source access rules before enabling such checks. The current log adapter queries project-level resources. See [Logging access control](https://docs.cloud.google.com/logging/docs/access-control).
+
+## 7. Builder and Scheduler permissions
+
+These are different identities from the runtime account:
+
+| Identity | Role | Scope |
+|---|---|---|
+| BUILDER_SA | `roles/run.builder` | Main project |
+| SCHEDULER_SA | `roles/run.invoker` | Deployed monitoring function only |
+
+```bash
+gcloud projects add-iam-policy-binding "$MAIN_PROJECT" \
+  --member="serviceAccount:$BUILDER_SA" --role=roles/run.builder
+```
+
+Add the Scheduler invoker grant after deploying the function (step 11). Neither account needs access to source datasets or logs in monitored projects. Keep Google's managed Scheduler service agent permissions intact.
+
+## 8. Add a profile and a monitoring rule
+
+The tables start empty. Use the BigQuery editor in the main project to add your configuration. Replace all sample project IDs and email addresses in the SQL below. These MERGE statements create examples only when their IDs are absent; rerunning them does not overwrite existing configuration.
+
+```sql
+MERGE `MAIN_PROJECT.monitoring.notification_profiles` AS target
+USING (SELECT 'data-team' AS profile_id) AS example
+ON target.profile_id = example.profile_id
+WHEN NOT MATCHED THEN
+  INSERT (profile_id, email_addresses, only_problems, is_active)
+  VALUES (example.profile_id, ['team@example.com'], FALSE, FALSE);
+
+MERGE `MAIN_PROJECT.monitoring.monitoring_rules` AS target
+USING (SELECT 'orders-count' AS rule_id) AS example
+ON target.rule_id = example.rule_id
+WHEN NOT MATCHED THEN INSERT (
+  rule_id, rule_name, project_id, service_type, resource_name, resource_url,
+  location, check_type, kpi_query, comparison_operator, threshold_value,
+  window_minutes, target_profiles, owner, is_active
+)
+VALUES (
+  example.rule_id, 'Orders received in the last 24 hours',
+  'MONITORED_PROJECT', 'BIGQUERY', 'warehouse.orders',
+  'https://console.cloud.google.com/bigquery?project=MONITORED_PROJECT',
+  'EU', 'SQL_KPI',
+  '''SELECT COUNT(*) AS value FROM `MONITORED_PROJECT.warehouse.orders`
+     WHERE created_at >= @window_start AND created_at < @window_end''',
+  'LT', 100, 1440, ['data-team'], 'Data Platform', FALSE
+);
+```
+
+Set the rule's `location` to the source dataset location and ensure `created_at` is a TIMESTAMP. After review, enable both records:
+
+```sql
+UPDATE `MAIN_PROJECT.monitoring.notification_profiles`
 SET is_active = TRUE WHERE profile_id = 'data-team';
-UPDATE `your-monitoring-project.monitoring.monitoring_rules`
+UPDATE `MAIN_PROJECT.monitoring.monitoring_rules`
 SET is_active = TRUE WHERE rule_id = 'orders-count';
 ```
 
-Only explicit TRUE values activate records. IDs must be unique and referenced profiles active. Configuration editors are trusted operators: their queries run with the runtime identity and their profiles control recipients. Validate exported rule JSON with `python -m src.cli validate examples/rules.json`; SQL syntax and permissions are checked during live preview.
+One row represents one check. IDs must be unique, referenced profiles must be active, and only explicit `is_active = TRUE` rows are evaluated. Configuration authors are trusted operators because SQL executes with the runtime's data access.
 
-### 6. Deploy the function from source
+| Rule field | Meaning |
+|---|---|
+| `project_id`, `service_type` | Monitored project and service category |
+| `resource_name`, `resource_url` | Readable resource name and HTTPS console link |
+| `resource_id` | Optional descriptive resource ID; does not automatically scope a check |
+| `check_type` | LOG, SQL_KPI, FRESHNESS, ROW_COUNT, NULL_RATE, DUPLICATES |
+| `log_filter` | Resource-specific Cloud Logging filter for LOG |
+| `kpi_query` | Single SELECT returning exactly one numeric column named `value` and one row |
+| `check_config` | JSON settings for built-in SQL templates |
+| `comparison_operator`, `threshold_value`, `threshold_upper` | Alarm condition and numeric bounds |
+| `window_minutes`, `location` | Rolling observation window and source BigQuery location |
+| `target_profiles`, `owner`, `pipeline_id`, `runbook_url` | Recipient routing and operational context |
+| `rule_version`, `severity`, `no_data_policy` | Configuration version, priority, and behavior for NULL results |
 
-```bash
-cp deploy.env.yaml.example deploy.env.yaml
+Comparisons describe **alarm conditions**: LT 100 alerts below 100; GT 0 alerts above zero. Supported operators: GT, GE, LT, LE, EQ, NE, OUTSIDE_RANGE. Range boundaries are acceptable values. `no_data_policy` is NO_DATA, ALERT, or OK. Zero is an observation, not missing data. Invalid result shapes and NaN/infinity are ERRORs.
+
+For LOG, provide a filter such as `resource.type="cloud_run_revision" AND resource.labels.service_name="orders-ingestion" AND severity>=ERROR`, set the service category to CLOUD_RUN, and use GT 0. Display names do not filter logs automatically. A zero error count does not prove that a process executed.
+
+Built-in SQL templates use `check_config` with `table` (fully qualified) and `timestamp_column` (TIMESTAMP). ROW_COUNT counts window rows; FRESHNESS returns age in minutes of the last timestamp before the window end, looking across history. NULL_RATE additionally needs `column` and returns a fraction from 0 to 1. DUPLICATES additionally needs a non-empty `key_columns` array and counts excess rows in the window. SQL parameters `@window_start` and `@window_end` define a half-open interval. Increment `rule_version` when changing a rule; each result stores its evaluated configuration.
+
+## 9. Deploy functions/monitoring/ as one function
+
+### Function settings
+
+| Setting | Value |
+|---|---|
+| Source folder | **functions/monitoring/** |
+| Function entry point | **run_monitoring** |
+| Runtime | Python 3.12 |
+| Trigger | HTTP |
+| Authentication | Required |
+| Execution service account | RUNTIME_SA |
+| Build service account | BUILDER_SA |
+| Memory / request timeout | 512 MiB / 1,800 seconds |
+| Concurrency / maximum instances | 1 / 1 |
+
+In the Cloud Run console, use **Write a function**, select Python 3.12, require authentication, and set the execution identity and runtime limits. In the source editor or supported source upload workflow, preserve all files from `functions/monitoring/`, with `main.py` and `requirements.txt` directly at source root. Set entry point `run_monitoring`. Source upload controls can vary; the following CLI command is the reproducible deployment path.
+
+### Environment variables
+
+Create a private `deploy.env.yaml` file **at the repository root**, outside the function folder. Copy this block into it and replace the project/bucket values:
+
+```yaml
+GOOGLE_CLOUD_PROJECT: "your-monitoring-project"
+METADATA_DATASET: "monitoring"
+BQ_LOCATION: "EU"
+STATE_BUCKET: "your-monitoring-project-monitor-state"
+REPORT_TIMEZONE: "Europe/Warsaw"
+MAXIMUM_BYTES_BILLED: "1073741824"
+QUERY_TIMEOUT_SECONDS: "60"
+LOG_ENTRY_LIMIT: "10000"
+RUN_BUDGET_SECONDS: "1500"
+NOTIFICATIONS_ENABLED: "false"
+SMTP_HOST: "smtp.example.com"
+SMTP_PORT: "587"
+SMTP_USER: ""
+SMTP_FROM: "monitor@example.com"
+SMTP_SECURITY: "starttls"
 ```
 
-Edit `deploy.env.yaml` to match your settings. Keep `NOTIFICATIONS_ENABLED: "false"`. Values must be strings; do not add the SMTP password. This file is ignored by Git and excluded from source uploads.
+The first four settings identify the hosting resources. `BQ_LOCATION` refers to metadata; source query locations are set per rule. Keep notification delivery disabled for the first preview. All YAML values are strings. SMTP_PASS is supplied through Secret Manager, not this file. The environment file is ignored by Git.
+
+From the repository root:
 
 ```bash
-gcloud run deploy "$FUNCTION_NAME" --project="$PROJECT_ID" --region="$REGION" \
-  --source=. --function=run_monitoring --base-image=python312 \
-  --build-service-account="projects/$PROJECT_ID/serviceAccounts/$BUILDER_SA" \
+gcloud run deploy "$FUNCTION_NAME" --project="$MAIN_PROJECT" --region="$REGION" \
+  --source=functions/monitoring --function=run_monitoring --base-image=python312 \
+  --build-service-account="projects/$MAIN_PROJECT/serviceAccounts/$BUILDER_SA" \
   --service-account="$RUNTIME_SA" --env-vars-file=deploy.env.yaml \
-  --no-allow-unauthenticated --timeout=1800 --memory=512Mi \
-  --concurrency=1 --max-instances=1
+  --no-allow-unauthenticated --invoker-iam-check \
+  --timeout=1800 --memory=512Mi --concurrency=1 --max-instances=1
 
 export FUNCTION_URL="$(gcloud run services describe "$FUNCTION_NAME" \
-  --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+  --project="$MAIN_PROJECT" --region="$REGION" --format='value(status.url)')"
 ```
 
-Google manages source building and runtime artifacts. You do not run `docker build` or create an image URI. `.gcloudignore` uploads only `main.py`, `requirements.txt`, and `src/`. IAM authentication must remain enabled; do not grant `allUsers` or `allAuthenticatedUsers` access. When updating an existing service, inspect its IAM policy because existing public grants may need explicit removal.
+Do not make the function public. If updating an existing service, inspect and remove any previous public invoker grants. Source builds and runtime artifacts are managed by GCP; no Docker commands or image configuration files are needed.
 
-### 7. Preview before sending email
+### Preview
 
-An administrator can grant your testing identity `roles/run.invoker` on this function:
+Grant an authorized testing identity invoker access if needed, then call the function:
 
 ```bash
-gcloud run services add-iam-policy-binding "$FUNCTION_NAME" --region="$REGION" \
+gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+  --project="$MAIN_PROJECT" --region="$REGION" \
   --member="user:YOUR_EMAIL" --role=roles/run.invoker
 
 curl --fail-with-body -X POST "$FUNCTION_URL" \
@@ -197,77 +331,93 @@ curl --fail-with-body -X POST "$FUNCTION_URL" \
   -H "Content-Type: application/json" -d '{"preview":true}'
 ```
 
-Preview reads live data and writes results/artifacts but sends no email. Inspect the returned `run_id`, the BigQuery history tables, and the private report:
+Preview runs real queries and saves results/reports, but sends no email. Check `monitoring_results` and `monitoring_runs`, and use the returned run ID to download the private report:
 
 ```bash
 gcloud storage cp "gs://$STATE_BUCKET/reports/RUN_ID/data-team.html" ./preview.html
 ```
 
-Manual requests may specify `"window_end":"2026-01-02T08:00:00Z"`. Scheduled calls use their scheduled timestamp and cannot override it. Missing rules or invalid configuration return a visible error rather than a misleading successful empty run.
+## 10. Enable email delivery
 
-### 8. Configure SMTP and test delivery
-
-Create the secret once, then add password versions outside source control:
+In the main project, create the password secret once and add its value without placing it in code or command history:
 
 ```bash
-gcloud secrets create gcp-monitor-smtp-password --replication-policy=automatic
+gcloud secrets create gcp-monitor-smtp-password \
+  --project="$MAIN_PROJECT" --replication-policy=automatic
 read -r -s -p "SMTP password: " SMTP_PASSWORD
 printf '\n'
-printf '%s' "$SMTP_PASSWORD" | gcloud secrets versions add gcp-monitor-smtp-password --data-file=-
+printf '%s' "$SMTP_PASSWORD" | gcloud secrets versions add gcp-monitor-smtp-password \
+  --project="$MAIN_PROJECT" --data-file=-
 unset SMTP_PASSWORD
 
 gcloud secrets add-iam-policy-binding gcp-monitor-smtp-password \
-  --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor
+  --project="$MAIN_PROJECT" --member="serviceAccount:$RUNTIME_SA" \
+  --role=roles/secretmanager.secretAccessor
 ```
 
-Set SMTP host, port, user, sender, and TLS mode in `deploy.env.yaml`; set `NOTIFICATIONS_ENABLED: "true"`. Use STARTTLS/587 or SSL/465 as required by the provider. Verify sender/domain authorization with your provider.
+Configure the SMTP provider values in `deploy.env.yaml`, verify the sender/domain with your provider, and set `NOTIFICATIONS_ENABLED: "true"`. Use STARTTLS/587 or SSL/465 according to the provider.
 
 ```bash
-# Replace 1 with the actual uploaded version.
-gcloud run services update "$FUNCTION_NAME" --region="$REGION" \
+# Replace 1 with the actual secret version.
+gcloud run services update "$FUNCTION_NAME" --project="$MAIN_PROJECT" --region="$REGION" \
   --env-vars-file=deploy.env.yaml --update-secrets=SMTP_PASS=gcp-monitor-smtp-password:1
 ```
 
-Repeat the authenticated POST with `{"preview":false}` and confirm delivery. Both this flag and the environment setting must allow email. Do not blindly repeat a timed-out delivery request; inspect run state and the SMTP provider first.
+Repeat the authenticated POST with `{"preview":false}` and verify delivery. Both this flag and the environment setting must allow email. Use Secret Manager IAM on this single secret, not project-wide secret access.
 
-### 9. Schedule the function
+## 11. Schedule the deployed function
 
-Create the schedule after validating the function and report recipients:
+After validating a report and its recipients:
 
 ```bash
-gcloud run services add-iam-policy-binding "$FUNCTION_NAME" --region="$REGION" \
+gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+  --project="$MAIN_PROJECT" --region="$REGION" \
   --member="serviceAccount:$SCHEDULER_SA" --role=roles/run.invoker
 
-gcloud scheduler jobs create http gcp-monitor-daily --location="$REGION" \
-  --schedule='0 8 * * *' --time-zone='Europe/Warsaw' \
+gcloud scheduler jobs create http gcp-monitor-daily --project="$MAIN_PROJECT" \
+  --location="$REGION" --schedule='0 8 * * *' --time-zone='Europe/Warsaw' \
   --uri="$FUNCTION_URL" --http-method=POST \
   --oidc-service-account-email="$SCHEDULER_SA" --oidc-token-audience="$FUNCTION_URL" \
   --headers='Content-Type=application/json' --message-body='{"preview":false}' \
   --attempt-deadline=1800s --max-retry-attempts=0 --max-retry-duration=0s
 ```
 
-For an initial scheduled preview, use `{"preview":true}` instead. Creation activates the schedule; use `gcloud scheduler jobs pause gcp-monitor-daily --location="$REGION"` when needed. Keep the audience equal to the base function URL. Preserve the Google-managed Scheduler service agent role.
-
-Each rule uses a rolling window. A 1,440-minute window is not the previous local calendar day; DST changes can cause daily overlap/gaps. Use UTC scheduling for fixed daily windows or explicit calendar SQL.
-
-## Operations, limits, and validation
-
-- SQL limits default to 1 GiB scanned per query and a 60-second result wait. Cancellation is best effort and queries can incur charges. Only one scalar SELECT is accepted.
-- Log reads use one deadline across pages and a 10,000-entry limit; truncation is an ERROR, never a fabricated exact count.
-- Evaluations are sequential with a 25-minute orchestration budget, leaving time for persistence inside the 30-minute HTTP deadline. Use modest rule sets. Individual API operations and retries can extend beyond the orchestration budget.
-- Results use one BigQuery load job per run. The function retains partial observations on graceful failure, checkpoints delivery progress, and attempts a terminal Storage state even when BigQuery history is unavailable.
-- Duplicate scheduled runs are claimed atomically. SMTP and state writes are not a transaction: exactly-once email is not guaranteed. Failed/interrupted claims need operator inspection.
-- Configure independent alerts for failed Scheduler requests and missing completion logs. GET /healthz checks process liveness only.
-- Storage objects have no automatic expiry in this manual. Configure report retention separately from claims; deleting claims shortens the deduplication horizon.
-
-See [operations and recovery](docs/OPERATIONS.md) and [operational SQL](sql/03_operational_queries.sql). Source builds, runtime requests, BigQuery, Storage, Secret Manager, and SMTP can incur charges. Existing Terraform-managed installations require an explicit ownership/migration decision before using manual gcloud updates; removing repository files does not destroy their infrastructure.
+The OIDC audience is the base function URL. Job creation activates the schedule. Use preview=true for scheduled previews, or pause the job while editing configuration:
 
 ```bash
-ruff check main.py src tests
-ruff format --check main.py src tests
-python -m pytest -q
+gcloud scheduler jobs pause gcp-monitor-daily --project="$MAIN_PROJECT" --location="$REGION"
 ```
 
-CI tests Python 3.11/3.12 on Windows/Linux and loads the function using only production requirements. It does not deploy cloud resources or send email. Local tests mock cloud APIs; live SQL execution, GCP IAM, source builds, and SMTP delivery must be verified in your own project.
+## 12. Verify and operate
+
+Check these before relying on the daily report:
+
+1. The function uses RUNTIME_SA and source `functions/monitoring/`, with entry point `run_monitoring`.
+2. The four tables exist in the configured dataset/location, with at least one valid active rule/profile.
+3. Runtime IAM is applied separately in the main project and every selected source project/dataset.
+4. A preview produces numerical results and a private HTML artifact.
+5. An intentional live request delivers the expected report.
+6. Scheduler receives a successful response, and an independent alert detects failed/missing scheduled runs.
+
+| Symptom | Check |
+|---|---|
+| 401/403 invoking the function | Invoker role, IAM authentication, Scheduler identity, OIDC audience |
+| Rule ERROR / source access denied | Runtime grants in the source project/dataset, query location, filter, scalar result contract |
+| Failed persistence | Main-project jobUser, history-table dataEditor, bucket objectUser |
+| Report exists but email is absent | Preview flag, NOTIFICATIONS_ENABLED, SMTP/TLS, secret access/version, sender verification |
+| Empty configuration / HTTP 500 | Explicit is_active flags, valid unique IDs, active recipient profiles |
+| HTTP 409 | Existing execution claim; inspect it before replaying |
+
+Rule statuses are OK, ALERT, ERROR, NO_DATA. Run status NEEDS_ATTENTION covers empty/invalid configuration, failed checks, or failed delivery and returns HTTP 500. COMPLETED may still contain valid ALERT/NO_DATA results. FAILED means orchestration or persistence failed. Notification status distinguishes PREVIEW, DISABLED, SENT, and FAILED.
+
+Scheduled runs use an atomic claim in `gs://STATE_BUCKET/runs/RUN_ID.json`. Completed duplicates do not repeat work. Failed or interrupted claims require inspection; SMTP acceptance and state writes are not a transaction, so exactly-once email is not guaranteed. Review BigQuery history, Storage state, function logs, and your SMTP provider before manually retrying. A manual preview can specify a timezone-aware `window_end`; scheduled requests use their scheduled timestamp and cannot override it. If the process is killed or Storage is unavailable, the last persisted checkpoint remains.
+
+The function evaluates sequentially, batches result writes, and checks a 25-minute orchestration budget. SQL has a default 1 GiB scan cap and 60-second result wait; log reads share a deadline across pages and stop with ERROR above 10,000 entries. Use modest rule sets and compact audit tables for expensive freshness checks. Cancellation is best effort and may incur charges.
+
+Windows are rolling, not previous local calendar days. A 1,440-minute window with a local-time daily schedule can overlap or leave gaps at DST transitions. Use UTC scheduling for uniform windows or explicit calendar SQL. GET /healthz checks process liveness only. Independently monitor missing `monitor_run_finished ... status=COMPLETED` logs and failed Scheduler calls.
+
+History-table partitions default to 90 days. Configure private report retention separately from execution claims; deleting claims shortens the deduplication horizon. GCP builds, BigQuery, runtime requests, Storage, Secret Manager, and SMTP may incur costs.
+
+To update code, redeploy the same function folder and run a preview. Existing installations managed outside this manual require an explicit ownership/migration decision before changing them. This repository contains deployable function source, object-creation SQL, and documentation; development tests and CI configuration are not part of the deployment package. Live SQL, IAM, builds, and SMTP must be verified in your own project.
 
 MIT license; see [LICENSE](LICENSE).
