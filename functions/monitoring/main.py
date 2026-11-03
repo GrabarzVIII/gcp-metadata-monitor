@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import functions_framework
-from config import get_settings, require_boolean
+from config import get_settings
 from flask import Request, jsonify
 from monitor import create_clients, run_monitor
 
@@ -40,7 +40,8 @@ def run_monitoring(request: Request):
         if payload.keys() - {"preview", "window_end"}:
             raise ValueError("Unexpected request fields")
         preview = payload.get("preview", True)
-        require_boolean(preview, "preview")
+        if type(preview) is not bool:
+            raise ValueError("preview must be a boolean")
         window_end = payload.get("window_end")
         if window_end is not None:
             window_end = parse_timestamp(window_end)

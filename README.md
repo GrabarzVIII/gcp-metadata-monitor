@@ -13,8 +13,8 @@ sql/
 functions/
   monitoring/                       Upload THIS folder as ONE Cloud Run function
     main.py                         Entry point: run_monitoring
-    config.py                       Environment settings and rule validation
-    monitor.py                      Log/SQL checks, history, and run coordination
+    config.py                       Environment defaults and settings loader
+    monitor.py                      Rule validation, checks, history, and run coordination
     report.py                       HTML rendering and SMTP delivery
     daily_report.html               Email template
     requirements.txt                Python dependencies installed by GCP
@@ -29,9 +29,9 @@ functions/
 
 **Deploy the entire `functions/monitoring/` folder as one function.** All runtime files are at the same level. For a source ZIP, zip the **contents** of that folder so `main.py` and `requirements.txt` are at the ZIP root; do not add an outer `functions/monitoring/` directory inside the ZIP.
 
-The function uses ordinary imports between neighboring Python files. No package directory or `__init__.py` file is needed. `main.py` handles HTTP requests, `config.py` validates settings and rules, `monitor.py` performs checks and records results, and `report.py` prepares and sends reports.
+The function uses ordinary imports between neighboring Python files. No package directory or `__init__.py` file is needed. `main.py` handles HTTP requests, `config.py` loads environment settings, `monitor.py` validates metadata, performs checks, and records results, and `report.py` prepares and sends reports.
 
-The application uses plain functions and dictionaries, with no custom classes or Pydantic models. `run_monitoring()` calls `run_monitor()`, which reads and validates metadata, runs checks, saves results, and prepares reports. Settings come from environment variables; metadata validation is handled by `validate_rule()` and `validate_profile()`.
+The application uses plain functions and dictionaries, with no custom classes or Pydantic models. `run_monitoring()` calls `run_monitor()`, which reads and validates metadata, runs checks, saves results, and prepares reports. `config.py` contains one `DEFAULTS` dictionary and one `get_settings()` function. Cloud Run environment variables override those defaults; the loader converts numbers and booleans and checks supported values and limits. Configure deployment values through `deploy.env.yaml` and SMTP credentials through Secret Manager. Monitoring rules and recipients are configured through the SQL INSERT scripts; their validation and alarm evaluation live in `monitor.py`.
 
 Only one function is required. Cloud Scheduler calls it; Scheduler, BigQuery, Storage, and Secret Manager are supporting GCP resources, not additional function folders. No stored procedures are required. KPI rules execute a single SELECT directly.
 
