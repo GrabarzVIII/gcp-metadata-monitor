@@ -31,6 +31,8 @@ functions/
 
 The function uses ordinary imports between neighboring Python files. No package directory or `__init__.py` file is needed. `main.py` handles HTTP requests, `config.py` validates settings and rules, `monitor.py` performs checks and records results, and `report.py` prepares and sends reports.
 
+The application uses plain functions and dictionaries, with no custom classes or Pydantic models. `run_monitoring()` calls `run_monitor()`, which reads and validates metadata, runs checks, saves results, and prepares reports. Settings come from environment variables; metadata validation is handled by `validate_rule()` and `validate_profile()`.
+
 Only one function is required. Cloud Scheduler calls it; Scheduler, BigQuery, Storage, and Secret Manager are supporting GCP resources, not additional function folders. No stored procedures are required. KPI rules execute a single SELECT directly.
 
 ## 2. Projects and service accounts

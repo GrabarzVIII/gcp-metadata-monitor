@@ -3,6 +3,4 @@ google-cloud-bigquery==3.47.0
 google-cloud-logging==3.17.0
 google-cloud-storage==3.17.1
 Jinja2==3.1.6
-pydantic==2.14.2
-pydantic-settings==2.16.2
 tzdata==2026.6
