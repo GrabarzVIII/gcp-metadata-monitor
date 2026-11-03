@@ -65,6 +65,28 @@ export SCHEDULER_SA="gcp-monitor-scheduler@$MAIN_PROJECT.iam.gserviceaccount.com
 gcloud config set project "$MAIN_PROJECT"
 ```
 
+### Exact IAM role matrix (per service account)
+
+Grant the following roles to the **named service account**, at the **specified resource scope**. The three accounts have different purposes; do not give the Builder or Scheduler the Runtime account's data permissions. "Conditional" means the role is needed only if the corresponding monitoring feature is enabled.
+
+| Service account (principal) | IAM role | Grant on | Required for |
+|---|---|---|---|
+| `RUNTIME_SA` (`gcp-monitor-runtime@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/bigquery.jobUser` | **MAIN_PROJECT** (project) | Always: creates and bills BigQuery query/load jobs here |
+| `RUNTIME_SA` | `roles/bigquery.dataViewer` | **MAIN_PROJECT.monitoring** (metadata dataset) | Always: reads `monitoring_rules` and `notification_profiles`; replace `monitoring` if configured differently |
+| `RUNTIME_SA` | `roles/bigquery.dataEditor` | **MAIN_PROJECT.monitoring.monitoring_results** (table) | Always: appends check results |
+| `RUNTIME_SA` | `roles/bigquery.dataEditor` | **MAIN_PROJECT.monitoring.monitoring_runs** (table) | Always: appends run history |
+| `RUNTIME_SA` | `roles/storage.objectUser` | **gs://STATE_BUCKET** (bucket) | Always: creates, reads, and updates execution state and reports |
+| `RUNTIME_SA` | `roles/logging.viewer` | **Each project with monitored logs** | Conditional: ordinary `LOG` checks, including Cloud Run/Scheduler/Workflows/Dataform log checks |
+| `RUNTIME_SA` | `roles/logging.privateLogViewer` | **Each project whose private logs are monitored** | Conditional: Data Access/private logs; **use instead of** `roles/logging.viewer` for that project (it includes ordinary log access) |
+| `RUNTIME_SA` | `roles/bigquery.dataViewer` | **Each source dataset or individual source table** in a monitored project | Conditional: `SQL_KPI`, `FRESHNESS`, `ROW_COUNT`, `NULL_RATE`, `DUPLICATES` |
+| `RUNTIME_SA` | `roles/secretmanager.secretAccessor` | **gcp-monitor-smtp-password** (one Secret Manager secret in MAIN_PROJECT) | Conditional: SMTP password provided through Secret Manager |
+| `BUILDER_SA` (`gcp-monitor-builder@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/run.builder` | **MAIN_PROJECT** (project) | Always for source deployment using `--build-service-account` |
+| `SCHEDULER_SA` (`gcp-monitor-scheduler@MAIN_PROJECT.iam.gserviceaccount.com`) | `roles/run.invoker` | **Deployed Cloud Run function/service only** | Required to call the function from Cloud Scheduler; grant after deployment |
+
+**Where to assign roles:** Runtime's BigQuery job role and Builder's build role belong to the **main project**; read roles for external datasets and logs belong to the **monitored resources** (which may also be in the main project). The Scheduler invoker role belongs on the **Cloud Run service**, not on every service in the project. A source project does **not** need `roles/bigquery.jobUser` for this application because its jobs execute in MAIN_PROJECT. Follow sections 5–7 for exact `gcloud` and SQL grants.
+
+**Deployment operator is a separate principal, not one of the three service accounts.** The user or CI identity running `gcloud run deploy` needs `roles/run.sourceDeveloper` and `roles/serviceusage.serviceUsageConsumer` on MAIN_PROJECT, plus `roles/iam.serviceAccountUser` on RUNTIME_SA **and** BUILDER_SA. The identity creating the Scheduler job also needs permission to create Scheduler jobs (for example `roles/cloudscheduler.admin` on MAIN_PROJECT) and `roles/iam.serviceAccountUser` on SCHEDULER_SA. Resource creation, API enablement, and IAM policy editing require separate administrator privileges; do not grant these to the runtime/build/scheduler accounts just to run monitoring. Avoid broad `roles/editor` or `roles/owner` grants.
+
 The main project must have billing enabled. An administrator performs resource creation, API enablement, and IAM changes. These setup permissions are separate from the runtime account's permissions below. For source deployment, the deployer needs `roles/run.sourceDeveloper` and `roles/serviceusage.serviceUsageConsumer` in the main project, plus `roles/iam.serviceAccountUser` on the runtime and builder accounts. The Scheduler operator needs permission to create jobs and act as its Scheduler account. See [Google's deployment requirements](https://docs.cloud.google.com/run/docs/deploy-functions).
 
 ## 3. Create the supporting resources in the main project
@@ -173,6 +195,13 @@ export MONITORED_PROJECT="your-source-project"
 gcloud services enable logging.googleapis.com --project="$MONITORED_PROJECT"
 gcloud projects add-iam-policy-binding "$MONITORED_PROJECT" \
   --member="serviceAccount:$RUNTIME_SA" --role=roles/logging.viewer
+```
+
+If private/Data Access logs are monitored, replace the ordinary Logs Viewer grant in that project with `roles/logging.privateLogViewer`:
+
+```bash
+gcloud projects add-iam-policy-binding "$MONITORED_PROJECT" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/logging.privateLogViewer
 ```
 
 For each source dataset, run this grant in that dataset's BigQuery location:
